@@ -1,0 +1,280 @@
+---
+title: "Spring phenology tier2 project"
+author: "Constantin Zohner"
+date: "Last run: `r format(Sys.Date(), '%d %B %Y')`"
+subtitle: "Run moving-window models for fixed preseasons (PEP725 data)"
+
+format:
+  html:
+    toc: false
+    theme: default
+    highlight-style: haddock
+    df-print: paged
+    embed-resources: true
+
+execute:
+  warning: false
+  message: false
+  echo: true
+  output: true
+
+always_allow_html: true
+editor: visual
+editor_options:
+  chunk_output_type: inline
+---
+
+<br>
+
+### **Driver names**
+
+Tmax.PS60: Mean maximum daily temperature 60 days prior to series-level mean leaf-out
+
+Tmax.spring60: Mean maximum daily temperature 60 days prior to species-level mean leaf-out
+
+<br>
+
+# 1. Setup
+
+<details>
+
+<summary>Packages</summary>
+
+```{r}
+require(tidyverse)
+require(data.table)
+require(broom)
+require(pbmcapply)
+```
+
+</details>
+
+<details>
+
+<summary>Directories</summary>
+
+```{r}
+#-------------------------------------------------------
+# Define the base directory
+#-------------------------------------------------------
+
+base.dir <- "/Users/goalie/Desktop/PhD/Publication_material/40_Spring_phenology_tier2/PEP725_Analysis"
+
+
+#-------------------------------------------------------
+# Build specific directories from the base
+#-------------------------------------------------------
+
+PEP_MW.dir    <- file.path(base.dir, "Analysis_input/PEP_drivers_final_spring_MW/MW15/Merged_file")
+PEP_clim.dir <- file.path(base.dir, "Analysis_input/Spring_climate")
+output.dir <- file.path(base.dir, "Analysis_output/ModelResults/Moving_window_analysis/Individual_files_fixed_preseason_models")
+```
+
+</details>
+
+<details>
+
+<summary>Data</summary>
+
+```{r}
+#------------------------------------------
+# Moving window data
+#------------------------------------------
+
+MW.df <- fread(paste(PEP_MW.dir, "pep_MW15_merged.csv", sep="/")) %>% 
+  dplyr::select(c(
+    # Identifiers
+    s_id, year, MWyear, species, timeseries,
+    # Phenology
+    phenology, leaf_out, 
+    # Climate (Mean maximum daily temperature 60 days prior to series-level mean leaf-out)
+    Tmax.PS60)) %>% 
+  # delete time series with too little variation in leaf-out dates (leaf-out SD ≤ 1)
+  group_by(phenology, species, timeseries, MWyear) %>%  
+  filter(sd(leaf_out, na.rm=T)>1) %>% 
+  ungroup() 
+
+
+#------------------------------------------
+# PEP data for climate
+#------------------------------------------
+
+PEP_clim.df <- fread(paste(PEP_clim.dir, "pep_drivers_spring_climate.csv", sep="/")) %>% 
+  dplyr::select(s_id, year, species,
+                Tmax.spring60)
+
+
+#------------------------------------------
+# Merge Moving window and PEP data
+#------------------------------------------
+
+MW.df = MW.df %>% left_join(., PEP_clim.df, by = join_by(s_id, year, species))
+
+
+# -------------------------------------------------------------------
+# Global shift for log-transforming temperature
+# -------------------------------------------------------------------
+# Goal: avoid undefined log(T) when Tmax <= 0, while keeping the transform
+# monotonic and *time-invariant* (same shift everywhere).
+#
+# We add a single constant so that (Tmax + shift) is always > 0:
+# shift = |min(Tmax)| + 0.01  -> ensures the minimum becomes +0.01.
+eps <- 0.01
+
+min_PS60     <- min(MW.df$Tmax.PS60, na.rm = TRUE)
+min_spring60 <- min(MW.df$Tmax.spring60, na.rm = TRUE)
+
+shift <- ifelse(
+  min(c(min_PS60, min_spring60)) <= 0,
+  abs(min(c(min_PS60, min_spring60))) + eps,
+  0
+)
+
+# print the shift value to the console for reproducibility
+shift
+
+MW.df = MW.df %>% 
+  
+  # remove time series with no variation in preseason temperature
+  group_by(phenology, species, timeseries, MWyear) %>%  
+  filter(sd(Tmax.spring60, na.rm=T)>0, 
+         sd(Tmax.PS60, na.rm=T)>0) %>% 
+  
+  # Create transformed predictors/response used in the different model variants
+  mutate(
+    # Log-transform leaf-out timing (addresses "inverse scaling" in response space)
+    leaf_out_log  = log(leaf_out),
+    
+    # Log-transform temperature after applying a global shift (avoids clipping artefacts)
+    Tmax.spring60_log = log(Tmax.spring60 + shift),
+    Tmax.PS60_log     = log(Tmax.PS60 + shift),
+    
+    # Z-score logged temperature within each MW group (removes variance-driven scaling in X)
+    # as.numeric() ensures a plain numeric vector (scale() otherwise returns a matrix)
+    Tmax.spring60_z_log = as.numeric(scale(Tmax.spring60_log)),
+    Tmax.PS60_z_log     = as.numeric(scale(Tmax.PS60_log))
+   ) %>% 
+   ungroup()
+
+rm(PEP_clim.df)
+```
+
+</details>
+
+<br>
+
+# 2. Analysis
+
+<details>
+
+<summary>Show</summary>
+
+```{r}
+#-------------------------------------------------------
+# 1. Create equations
+#-------------------------------------------------------
+
+equation.list <- list(
+  # St using mean Feb-Mar or Mar-Apr temperatures
+  St_PSfix_abs = formula("leaf_out     ~ Tmax.spring60"),       # days per °C
+  St_PSfix_log = formula("leaf_out_log ~ Tmax.spring60_log"),   # log-log transformed
+  St_PSfix_z   = formula("leaf_out_log ~ Tmax.spring60_z_log"), # logged y, scaled x
+  
+  # St using mean temperatures 60 days prior to series-level mean leaf-out
+  St_PS60_abs = formula("leaf_out     ~ Tmax.PS60"),      # days per °C
+  St_PS60_log = formula("leaf_out_log ~ Tmax.PS60_log"),  # log-log transformed
+  St_PS60_z   = formula("leaf_out_log ~ Tmax.PS60_z_log") # logged y, scaled x
+)
+
+# Equation identifier 
+equation.names = names(equation.list)
+
+
+#-------------------------------------------------------
+# 2. Loop through equations
+#-------------------------------------------------------
+
+parallelCalc <- function(equation.name){ 
+  
+  equation <- equation.list[[equation.name]]
+  
+  ModelResults.df <- MW.df %>%
+    group_by(phenology, species, timeseries, MWyear) %>%  
+    do({
+      df <- .
+      model.linear <- lm(equation, data = df)
+
+      # extract y and x from the model frame (handles transforms in formula)
+      mf <- model.frame(model.linear)
+      y  <- mf[[1]]
+      x  <- mf[[2]]
+
+      # variance components
+      SD_y <- sd(y, na.rm = TRUE)
+      SD_x <- sd(x, na.rm = TRUE)
+      var_ratio <- SD_y / SD_x
+      
+      # means
+      Mean_y <- mean(y, na.rm = TRUE)
+      Mean_x <- mean(x, na.rm = TRUE)
+
+      # simple correlation (robust to NAs)
+      ok <- is.finite(x) & is.finite(y)
+      r_xy <- if (sum(ok) >= 3 && SD_x > 0 && SD_y > 0) {
+        cor(x[ok], y[ok], use = "complete.obs")
+      } else {
+        NA_real_
+      }
+
+      tidy(model.linear) %>%
+        dplyr::filter(term != "(Intercept)") %>% 
+        dplyr::mutate(
+          equation  = equation.name,
+          sd_y      = SD_y,
+          sd_x      = SD_x,
+          var_ratio = var_ratio,
+          mean_y    = Mean_y,
+          mean_x    = Mean_x,
+          cor_xy    = r_xy
+        )
+    }) %>%
+    ungroup()
+  
+  write.table(
+    ModelResults.df,
+    file = paste0(output.dir, "/", equation.name, ".csv"),
+    sep = ",", row.names = FALSE, col.names = TRUE
+  )
+}
+
+
+#-------------------------------------------------------
+# 3. Run parallel code
+#-------------------------------------------------------
+
+#initialize the loop
+outputlist <- pbmclapply(equation.names, parallelCalc, mc.cores=6, mc.preschedule=F)
+
+#check how many files there are
+length(list.files(path=output.dir, pattern='.csv'))
+```
+
+</details>
+
+<br>
+
+# 3. Reproducibility
+
+<details>
+
+<summary>Show</summary>
+
+```{r}
+## datetime
+Sys.time()
+
+## session info
+sessionInfo()
+```
+
+</details>

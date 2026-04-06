@@ -1,0 +1,396 @@
+---
+title: Spring phenology tier2 project
+author: Constantin Zohner
+date: "last updated 9 May 2025"
+
+subtitle: Check sample sizes
+output:
+  html_document:
+    highlight: haddock
+    toc: false
+    use_bookdown: true
+    df_print: paged
+---
+
+<style>
+body
+  { counter-reset: source-line 0; }
+pre.numberSource code
+  { counter-reset: none; }
+</style>
+
+<br>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  class.source = "numberLines lineAnchors"
+  )
+```
+
+<br><br>
+
+## 1. Load packages and data
+
+<details><summary>get packages</summary>
+```{r}
+require(data.table)
+require(ggplot2)
+require(tidyverse)
+```
+</details>
+
+<details><summary>get data</summary>
+```{r}
+#########
+# Paths #
+#########
+
+PEP.dir = "/Users/consti/Desktop/PhD/Publication_material/40_Spring_phenology_tier2/PEP725_Analysis/Analysis_input/PEP_drivers_final_spring/Merged_file"
+figure.dir = "/Users/consti/Desktop/PhD/Publication_material/40_Spring_phenology_tier2/PEP725_Analysis/Analysis_output/LocationMaps"
+
+
+############### 
+# Import data #
+###############
+
+PEP.df     <- fread(paste(PEP.dir, "pep_drivers_spring_data.csv", sep="/"))
+
+
+#####################
+# Define plot theme #
+#####################
+
+plotTheme1 = theme(legend.background = element_rect(fill=NA, linewidth=0.5, linetype="solid"),
+                   legend.text       = element_text(color="black"),
+                   panel.grid.major  = element_blank(),
+                   panel.grid.minor  = element_blank(),
+                   panel.background  = element_blank(),
+                   panel.border      = element_rect(colour = "black", fill=NA),
+                   axis.line         = element_line(color = "black"),
+                   axis.text         = element_text(colour = "black"),
+                   strip.background  = element_rect(fill=NA),
+                   strip.text        = element_text(colour = 'black', face="italic"),
+                   plot.title        = element_text(face="bold"))
+
+```
+</details>
+
+<br>
+
+## 2. Data cleaning
+<details><summary>show code</summary>
+```{r}
+PEP.df = PEP.df %>%
+  dplyr::select(-c(V1)) %>% 
+  group_by(timeseries)%>%
+  # delete time series with fewer than 20 years
+  filter(n() >= 20) %>% 
+  # delete time series lacking inter-annual variation in radiation
+  filter(!(max(SWrad.PS10)-min(SWrad.PS10)==0)) %>% 
+  # add number of years per timeseries for full and reduced data
+  mutate(
+    n.years         = sum(!is.na(leaf_out)),
+    n.years.reduced = sum(!is.na(leaf_off))) %>% 
+  ungroup()
+
+#Safe table
+write.csv(PEP.df, paste(PEP.dir, "pep_drivers_spring_data_clean.csv", sep="/"))
+```
+</details>
+
+<br>
+
+## 3. Check sample sizes
+<details><summary>Full data</summary>
+```{r}
+#total observations
+nrow(PEP.df)
+
+#how many species have data?
+length(unique(PEP.df$species))
+
+#how many sites in total?
+length(unique(PEP.df$s_id))
+
+#how many unique coordinates in total?
+length(unique(PEP.df$lat, PEP.df$lon))
+
+#time span
+range(PEP.df$year)
+paste0("Minimum timeseries length = ",   min(PEP.df$n.years),
+       "; Maximum timeseries length = ", max(PEP.df$n.years))
+hist(PEP.df$n.years, xlab="Number of years", main="Time series length", breaks = 100)
+hist(PEP.df$year, xlab="Year", main="Temporal distribution of data", breaks = 100)
+
+#latitudinal and longitudinal gradients
+range(PEP.df$lon)
+range(PEP.df$lat)
+hist(PEP.df$lon, xlab="Longitude", main="Longitudinal gradient", breaks = 100)
+hist(PEP.df$lat, xlab="Latitude", main="Latitudinal gradient", breaks = 100)
+
+#elevation gradient 
+max(PEP.df$alt_dem)
+hist(PEP.df[PEP.df$alt_dem >= 0, ]$alt_dem, xlab="Elevation (m)", main="Elevational gradient", breaks = 100)
+
+#leaf-out data
+mean(PEP.df$leaf_out)
+sd(PEP.df$leaf_out)
+range(PEP.df$leaf_out)
+hist(PEP.df$leaf_out, xlab="Leaf-out date", main="Leaf-out gradient", breaks = 100)
+mean(PEP.df$leaf_out_sd)
+range(PEP.df$leaf_out_sd)
+hist(PEP.df$leaf_out_sd, xlab="Standard deviation", main="Intra-site leaf-out variation", breaks = 100)
+
+#Create summary dataframe
+sample.size = PEP.df %>%
+  group_by(species) %>%
+  summarize(n.time.series  = length(unique(s_id)),
+            n.observations = n(),
+            leaf_out_sd    = mean(leaf_out_sd))
+
+#Sample sizes within species
+data.frame(sample.size)
+
+#Total amount of times series
+sum(sample.size$n.time.series)
+
+#Bar Plot 
+sample.size = reshape2::melt(sample.size, id.vars = c("species"), measure.vars = c("n.time.series","n.observations"))
+ggplot(sample.size, aes(x=species, y=value)) + 
+  geom_bar(stat = "identity")+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  facet_wrap(~variable, nrow=2, scales="free_y")
+
+# Temporal coverage per species
+PEP.df %>%
+  ggplot(aes(x=year)) +
+  geom_histogram(position = 'identity', binwidth=1) +
+  facet_wrap(~species, ncol=4) +
+  theme_classic()
+
+
+#Location maps
+###############
+
+#Create map
+mp <- NULL
+mapWorld <- borders("world", colour="gray80", fill="gray80") # create a layer of borders
+mp <- ggplot() + mapWorld
+
+# Add sample sizes
+PEP.df <- PEP.df %>% 
+  # Calculate the count of each unique location
+  group_by(lat, lon) %>% 
+  mutate(location_count = n()) %>% 
+  # Calculate the count of each unique species-location combination
+  group_by(lat, lon, species) %>% 
+  mutate(location_count_species = n(),
+         # Crop at maximum maximum number of years per species-location combination
+         location_count_species = ifelse(location_count_species>max(.$n.years), max(.$n.years), location_count_species))
+
+# Layer all stations on top with color representing occurrence count
+mp_all <- mp + 
+  geom_point(data = PEP.df[!duplicated(PEP.df[ , c("lat", "lon")]), ], 
+             aes(x = lon, y = lat, color = location_count), 
+             size = 0.3, shape = 16, alpha = 0.8) +
+  scale_color_gradientn(colors = c("blue", "green", "yellow", "orange", "red"), 
+                        name = "Number of\nobservations") +
+  coord_cartesian(ylim = c(min(PEP.df$lat), max(PEP.df$lat)), 
+                  xlim = c(min(PEP.df$lon), max(PEP.df$lon))) +
+  xlab("Longitude") + ylab("Latitude") +
+  plotTheme1 +
+  theme(legend.position = c(0.05, 1),  # Adjust x and y coordinates (0,0 is bottom-left and 1,1 is top-right)
+        legend.justification = c("left", "top"),
+        legend.background = element_rect(fill = alpha("white", 0.7), color = NA),
+        legend.title = element_text(size = 10),
+        legend.text = element_text(size = 8))
+
+#save plot as .pdf
+ggsave(mp_all, file="AllLocations_final.pdf", path=figure.dir,
+       width=5, height=4)
+
+mp_all
+
+#Layer all stations for each species on top
+mp_species_wide <- mp + 
+  geom_point(data = PEP.df[!duplicated(PEP.df[ , c("lat", "lon", "species")]), ], 
+             aes(x = lon, y = lat, color = location_count_species), 
+             size = 0.1, shape = 16, alpha = 0.8) +
+  scale_color_gradientn(colors = c("blue", "green", "yellow", "orange", "red"), 
+                        name = "Number of\nobservations") +
+  coord_cartesian(ylim = c(min(PEP.df$lat), max(PEP.df$lat)), 
+                  xlim = c(min(PEP.df$lon), max(PEP.df$lon))) +
+  xlab("Longitude") + ylab("Latitude") +
+  facet_wrap(~species, ncol=5) +
+  plotTheme1 +
+  theme(strip.background = element_blank(),
+        strip.text = element_text(face = "italic"))
+
+#save plot as .pdf
+ggsave(mp_species_wide, file="SpeciesLocations_wide.pdf", path=figure.dir,
+       width=15, height=5)
+
+mp_species_wide
+
+mp_species_long <- mp + 
+  geom_point(data = PEP.df[!duplicated(PEP.df[ , c("lat", "lon", "species")]), ], 
+             aes(x = lon, y = lat, color = location_count_species), 
+             size = 0.1, shape = 16, alpha = 0.8) +
+  scale_color_gradientn(colors = c("blue", "green", "yellow", "orange", "red"), 
+                        name = "Number of\nobservations") +
+  coord_cartesian(ylim = c(min(PEP.df$lat), max(PEP.df$lat)), 
+                  xlim = c(min(PEP.df$lon), max(PEP.df$lon))) +
+  xlab("Longitude") + ylab("Latitude") +
+  facet_wrap(~species, ncol=2) +
+  plotTheme1 +
+  theme(strip.background = element_blank(),
+        strip.text = element_text(face = "italic"))
+
+#save plot as .pdf
+ggsave(mp_species_long, file="SpeciesLocations_long.pdf", path=figure.dir,
+       width=7, height=10)
+
+mp_species_long
+```
+</details>
+
+<details><summary>Reduced data</summary>
+```{r}
+PEP_reduced.df = PEP.df %>% filter(!is.na(leaf_off))
+
+#total observations
+nrow(PEP_reduced.df)
+
+#how many species have data?
+length(unique(PEP_reduced.df$species))
+
+#how many sites in total?
+length(unique(PEP_reduced.df$s_id))
+
+#time span 
+range(PEP_reduced.df$year)
+paste0("Minimum timeseries length = ",   min(PEP_reduced.df$n.years.reduced, na.rm = T),
+       "; Maximum timeseries length = ", max(PEP_reduced.df$n.years.reduced, na.rm = T))
+hist(PEP_reduced.df$n.years.reduced, xlab="Number of years", main="Time series length", breaks = 100)
+hist(PEP_reduced.df$year, xlab="Year", main="Temporal distribution of data", breaks = 100)
+
+#latitudinal and longitudinal gradients
+range(PEP_reduced.df$lon)
+range(PEP_reduced.df$lat)
+hist(PEP_reduced.df$lon, xlab="Longitude", main="Longitudinal gradient", breaks = 100)
+hist(PEP_reduced.df$lat, xlab="Latitude", main="Latitudinal gradient", breaks = 100)
+
+#elevation gradient 
+max(PEP_reduced.df$alt_dem)
+hist(PEP_reduced.df[PEP_reduced.df$alt_dem>=0,]$alt_dem, xlab="Elevation (m)", main="Elevational gradient", breaks = 100)
+
+#leaf-off data
+mean(PEP_reduced.df$leaf_off, na.rm=T)
+sd(PEP_reduced.df$leaf_off, na.rm=T)
+range(PEP_reduced.df$leaf_off, na.rm=T)
+hist(PEP_reduced.df$leaf_off, xlab="Leaf-off date", main="Leaf-off gradient", breaks = 100)
+
+#Create summary dataframe
+sample.size = PEP_reduced.df %>%
+  group_by(species) %>%
+  summarize(n.time.series = length(unique(s_id)),
+            n.observations = n())
+
+#Sample sizes within species
+data.frame(sample.size)
+
+#Total amount of times series
+sum(sample.size$n.time.series)
+
+#Bar Plot 
+sample.size = reshape2::melt(sample.size, id.vars = c("species"), measure.vars = c("n.time.series","n.observations"))
+ggplot(sample.size, aes(x=species, y=value)) + 
+  geom_bar(stat = "identity")+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  facet_wrap(~variable, nrow=2, scales="free_y")
+
+# Temporal coverage per species
+PEP_reduced.df %>%
+  ggplot(aes(x=year)) +
+  geom_histogram(position = 'identity', binwidth=1) +
+  facet_wrap(~species, ncol=5) +
+  theme_classic()
+
+
+#Location maps
+###############
+
+#Create map
+mp <- NULL
+mapWorld <- borders("world", colour="gray80", fill="gray80") # create a layer of borders
+mp <- ggplot() + mapWorld
+
+# Add sample sizes
+PEP_reduced.df <- PEP_reduced.df %>% 
+  # Calculate the count of each unique location
+  group_by(lat, lon) %>% 
+  mutate(location_count = n()) %>% 
+  # Calculate the count of each unique species-location combination
+  group_by(lat, lon, species) %>% 
+  mutate(location_count_species = n(),
+         # Crop at maximum number of years per site
+         location_count_species = ifelse(location_count_species>max(.$n.years.reduced), max(.$n.years.reduced), location_count_species))
+
+# Layer all stations on top with color representing occurrence count
+mp_all_red <- mp + 
+  geom_point(data = PEP_reduced.df[!duplicated(PEP_reduced.df[ , c("lat", "lon")]), ], 
+             aes(x = lon, y = lat, color = location_count), 
+             size = 0.3, shape = 16, alpha = 0.8) +
+  scale_color_gradientn(colors = c("blue", "green", "yellow", "orange", "red"), 
+                        name = "Number of\nobservations") +
+  coord_cartesian(ylim = c(min(PEP.df$lat), max(PEP.df$lat)), 
+                  xlim = c(min(PEP.df$lon), max(PEP.df$lon))) +
+  xlab("Longitude") + ylab("Latitude") +
+  theme_classic() +
+  theme(legend.position = c(0.05, 1),  # Adjust x and y coordinates (0,0 is bottom-left and 1,1 is top-right)
+        legend.justification = c("left", "top"),
+        legend.background = element_rect(fill = alpha("white", 0.7), color = NA),
+        legend.title = element_text(size = 10),
+        legend.text = element_text(size = 8))
+
+#save plot as .pdf
+ggsave(mp_all_red, file="AllLocations_final_leafoff.pdf", path=figure.dir,
+       width=5, height=4)
+
+mp_all_red
+
+#Layer all stations for each species on top
+mp_species_red <- mp + 
+  geom_point(data = PEP_reduced.df[!duplicated(PEP_reduced.df[ , c("lat", "lon", "species")]), ], 
+             aes(x = lon, y = lat, color = location_count_species), 
+             size = 0.3, shape = 16, alpha = 0.8) +
+  scale_color_gradientn(colors = c("blue", "green", "yellow", "orange", "red"), 
+                        name = "Number of\nobservations") +
+  coord_cartesian(ylim = c(min(PEP.df$lat), max(PEP.df$lat)), 
+                  xlim = c(min(PEP.df$lon), max(PEP.df$lon))) +
+  xlab("Longitude") + ylab("Latitude") +
+  facet_wrap(~species, ncol=2) +
+  theme_classic() +
+  theme(strip.background = element_blank(),
+        strip.text = element_text(face = "italic"))
+
+#save plot as .pdf
+ggsave(mp_species_red, file="SpeciesLocations_leafoff.pdf", path=figure.dir,
+       width=7, height=7.5)
+
+mp_species_red
+```
+
+</details>
+
+<br>
+
+## 4. Reproducibility
+<details><summary>show code</summary>
+```{r}
+## date time
+Sys.time()
+
+## session info
+sessionInfo()
+```

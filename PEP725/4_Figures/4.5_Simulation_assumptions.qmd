@@ -1,0 +1,211 @@
+---
+title: "Spring phenology tier2 project"
+subtitle: "Model simulation assumptions"
+author: "Constantin Zohner"
+date: "Last run: `r format(Sys.Date(), '%d %B %Y')`"
+
+format:
+  html:
+    toc: false
+    theme: default
+    highlight-style: haddock
+    df-print: paged
+    embed-resources: true
+
+execute:
+  #warning: false
+  message: false
+  echo: true
+  output: true
+
+always_allow_html: true
+editor: visual
+editor_options:
+  chunk_output_type: inline
+---
+
+<br>
+
+# 1. Setup
+
+<details>
+
+<summary>Packages</summary>
+
+```{r, message = F}
+require(ggplot2)
+require(patchwork)
+```
+
+</details>
+
+<details>
+
+<summary>Directories</summary>
+
+```{r}
+output.dir <- "/Users/goalie/Desktop/PhD/Publication_material/40_Spring_phenology_tier2/PEP725_Analysis/Analysis_output/Simulation_assumptions"
+```
+
+</details>
+
+<br>
+
+# 2. Analysis
+
+<details>
+
+<summary>Model functions</summary>
+
+```{r}
+#-----------------------------------------
+# Forcing units
+#-----------------------------------------
+
+GDD.fun = function(Temp, threshold_low){
+  if(Temp >= threshold_low) {GDD=Temp-threshold_low} else {GDD=0}
+  return(GDD)
+}
+
+
+#-----------------------------------------
+# Chilling model 
+#-----------------------------------------
+
+# Function for chilling dependency scaling factor
+chilling_response <- function(Chilling, requirement) {
+  factor <- pmin(Chilling / requirement, 1)  # chilling dependency reaches 1 at X chill days
+  return(factor)
+}
+# Chilling = actual chilling unit 
+# requirement = total chilling requirement (in days), i.e., after how many chill days is chilling completely fulfilled?
+
+
+#-----------------------------------------
+# Photoperiod model 
+#-----------------------------------------
+
+# Function for photoperiod sensitivity with different k and p values
+photoperiod_response <- function(DL, k, p) {
+  DL_adjusted <- pmax(DL - 6, 0)  # Shift DL so that it starts at 6 hours instead of 0
+  f_DL <- (log(1 + k * DL_adjusted) / log(1 + k * (20 - 6)))^p  # Normalize to DL = 20
+  f_DL <- pmin(f_DL, 1)  # Cap at 1 from DL = 20 to 24
+  return(f_DL)
+}
+```
+
+</details>
+
+<details>
+
+<summary>Plotting</summary>
+
+```{r}
+#-------------------------------------------------------
+# Forcing plot
+#-------------------------------------------------------
+
+# Create data
+temperature = c(-5:25)
+response=sapply(temperature, GDD.fun, threshold_low=5)
+forcing.df = data.frame(temperature, response)
+
+# Plot results
+forcing.plot = ggplot(forcing.df, aes(x = temperature, y = response)) +
+  geom_line(color='#e31a1c') +
+  labs(y = "Growing-degree days (GDDs)", x = "Temperature (°C)") +
+  theme_bw()
+
+
+#-------------------------------------------------------
+# Chilling plot
+#-------------------------------------------------------
+
+# Sample data
+Chill_values <- seq(0, 180, by=1)  # Photoperiod values from 8h to 24h
+
+# Compute GDD factor for all cases
+Chill_factor_high <- chilling_response(Chill_values, 150)
+Chill_factor_low  <- chilling_response(Chill_values, 75)
+
+# Combine results into a dataframe
+df <- data.frame(Chilling          = Chill_values,
+                 Chill_factor_high = Chill_factor_high,
+                 Chill_factor_low = Chill_factor_low)
+
+# Plot results
+chill.plot = ggplot(df, aes(x = Chilling)) +
+  geom_line(aes(y = Chill_factor_high), color="blue", linetype="dashed") +
+  geom_line(aes(y = Chill_factor_low), color="darkblue", linetype="dotted") +
+  labs(x = "Chilling days", y = "Chilling factor") +
+  theme_bw()
+
+
+#-------------------------------------------------------
+# Photoperiod plot
+#-------------------------------------------------------
+
+# Sample data
+DL_values <- seq(0, 24, by=1)  # Photoperiod values from 8h to 24h
+
+# Compute GDD factor for all cases
+DL_factor <- photoperiod_response(DL_values, 1, 1)
+
+# Combine results into a dataframe
+df <- data.frame(DayLength = DL_values,
+                 DL_factor = DL_factor)
+
+# Plot results
+photo.plot = ggplot(df, aes(x = DayLength)) +
+  geom_line(aes(y = DL_factor)) +
+  labs(x = "Photoperiod (hours)", y = "Photoperiod factor") +
+  coord_cartesian(xlim=c(1.13,22.9)) +
+  theme_bw()
+
+
+#-------------------------------------------------------
+# Define plot layout
+#-------------------------------------------------------
+
+layout3 <- "ABC"
+
+
+#-------------------------------------------------------
+# Merge plots
+#-------------------------------------------------------
+
+MainPlot = forcing.plot + chill.plot + photo.plot +
+  plot_layout(design = layout3) + plot_annotation(tag_levels = 'a')&
+  theme(plot.tag = element_text(face = 'bold'))
+
+MainPlot
+
+
+#-------------------------------------------------------
+# Save plot as .pdf
+#-------------------------------------------------------
+
+# Main plot (spring temperature anomalies + leaf-out anomalies + St + Z-scores)
+ggsave(MainPlot, file="Simulation_assumptions.pdf", path=output.dir,
+       width=9.5, height=3.2)
+```
+
+</details>
+
+<br>
+
+# 3. Reproducibility
+
+<details>
+
+<summary>show</summary>
+
+```{r}
+# Datetime
+Sys.time()
+
+# Session info
+sessionInfo()
+```
+
+</details>

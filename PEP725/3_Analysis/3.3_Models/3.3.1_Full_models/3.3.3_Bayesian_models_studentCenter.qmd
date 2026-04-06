@@ -1,0 +1,511 @@
+---
+title: "Spring phenology tier2 project"
+subtitle: "Run Bayesian hierarchical models using student distribution and centered response(PEP725 data)"
+author: "Constantin Zohner"
+date: "Last run: `r format(Sys.Date(), '%d %B %Y')`"
+
+format:
+  html:
+    toc: false
+    theme: default
+    highlight-style: haddock
+    df-print: paged
+    embed-resources: true
+
+execute:
+  #warning: false
+  message: false
+  echo: true
+  output: true
+
+always_allow_html: true
+editor: visual
+editor_options:
+  chunk_output_type: inline
+---
+
+<br>
+
+### Methods
+
+To isolate interannual, within-site drivers of spring phenology while avoiding spurious associations driven by shared temporal trends or between-site differences, all continuous climate predictors were centered and scaled within site, such that coefficients reflect responses to typical site-level anomalies. Green-up dates were centered within site to remove differences in mean phenological timing among sites.
+
+In the main analyses (see 3.3_Bayesian_models_MODIS.html), green-up anomalies were additionally scaled within site, allowing effect sizes to be interpreted as relative sensitivities (in units of within-site phenological variability) and ensuring equal weighting of sites when comparing the relative importance of climate drivers.
+
+As a robustness check, we refitted all models using unscaled (centered-only) green-up anomalies and a Student-t error distribution, which down-weights occasional extreme observations and provides inference in original phenological units (days). The consistency of results across these complementary model formulations indicates that our conclusions are not driven by site-specific differences in phenological variance or by a small number of anomalous observations.
+
+### Driver names
+
+-   leaf_out_prev: Leaf-out date in the previous year
+-   LSF2: Binary indicator of late spring frost event (\<-2°C) after leaf-out in previous year
+-   leaf_off: Leaf senescence date in the previous year
+-   Tmean: Daily mean air temperature (°C):
+    -   Previous year:
+        -   EQ1 = March equinox
+        -   SO1 = Summer solstice
+        -   EQ2 = September equinox
+        -   SO2 = December solstice
+    -   From 1-17: 1 = January of previous year, 13 = January of current year
+-   RH: Spring relative air humidity (%)
+-   SWrad: Spring (preseason) incoming short-wave solar radiation (W/m²)
+-   Tmax: Spring (preseason) Daily maximum air temperature (°C)
+
+<br>
+
+# 1. Setup
+
+<details>
+
+<summary>Packages</summary>
+
+```{r, message=F}
+library(tidyverse)
+library(data.table)
+library(car)
+library(brms)
+#install.packages("cmdstanr", repos = c("https://mc-stan.org/r-packages/", getOption("repos")))
+#cmdstanr::install_cmdstan()
+library(cmdstanr)
+options(brms.backend = "cmdstanr")
+```
+
+</details>
+
+<details>
+
+<summary>Directories</summary>
+
+```{r}
+#-------------------------------------------------
+# Define the base directory
+#-------------------------------------------------
+
+base.dir = "/Users/goalie/Desktop/PhD/Publication_material/40_Spring_phenology_tier2/PEP725_Analysis"
+
+
+#-------------------------------------------------
+# Build specific directories from the base
+#-------------------------------------------------
+
+# PEP data
+PEP.dir = file.path(base.dir, "Analysis_input/PEP_drivers_final_spring/Merged_file")
+
+# Output
+output.dir = file.path(base.dir, "Analysis_output/ModelResults/Bayesian_models")
+```
+
+</details>
+
+<details>
+
+<summary>Data</summary>
+
+```{r}
+#################
+## Import data ##
+#################
+
+
+
+#-----------------------------------------------------------
+# define model variables
+#-----------------------------------------------------------
+
+# Response
+response_vars = c("leaf_out")
+
+# List of full variables
+pred_vars = c("year", 
+              "leaf_out_prev", "leaf_off",
+              "Tmean.EQ1.SO1", "Tmean.SO1.EQ2", "Tmean.EQ2.SO2",
+              "Tmax","RH","SWrad")
+
+
+#-----------------------------------------------------------
+# Load full data
+#-----------------------------------------------------------
+
+PEP.df <- fread(paste(PEP.dir, "pep_drivers_spring_data_clean_preseason.csv", sep="/")) %>% 
+  dplyr::select(species, year, timeseries, lat, lon, alt_dem, 
+                LSF2,
+                all_of(c(response_vars,pred_vars))) %>% 
+  mutate(period = "full")
+
+
+#-----------------------------------------------------------
+# Reduced data including all leaf-off observations
+#-----------------------------------------------------------
+
+PEPred.df <- PEP.df %>% 
+  filter(!is.na(leaf_off)) 
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+####################
+## Filter periods ##
+####################
+
+
+
+#-----------------------------------------------------------
+# Define periods
+#-----------------------------------------------------------
+
+min.year.full = min(PEP.df$year) # Earliest year
+min.year.full
+max.year.full = max(PEP.df$year) # Latest year
+max.year.full
+year.center.full = round(median(c(min.year.full, max.year.full))) # central year
+year.center.full
+year.center.full-(min.year.full-1) #length of each period
+max.year.full-year.center.full
+
+
+#-----------------------------------------------------------
+# Early data full
+#-----------------------------------------------------------
+
+PEP_early.df <- PEP.df %>% 
+  mutate(period = "early") %>% 
+  filter(!alt_dem>600,
+         year>=min.year.full, 
+         year<=year.center.full) %>% 
+  group_by(timeseries)%>%
+  #delete time series with fewer than 20 years
+  filter(n() >= 20) %>% 
+  ungroup()
+
+
+#-----------------------------------------------------------
+# Early data reduced
+#-----------------------------------------------------------
+
+PEPred_early.df <- PEPred.df %>% 
+  mutate(period = "early") %>% 
+  filter(!alt_dem>600,
+         year>=min.year.full, 
+         year<=year.center.full) %>% 
+  group_by(timeseries)%>%
+  #delete time series with fewer than 20 years
+  filter(n() >= 20) %>% 
+  ungroup()
+
+
+#-----------------------------------------------------------
+# Late data full
+#-----------------------------------------------------------
+
+PEP_late.df <- PEP.df %>% 
+  mutate(period = "late") %>% 
+  filter(!alt_dem>600,
+         year>year.center.full) %>% 
+  group_by(timeseries)%>%
+  #delete time series with fewer than 20 years
+  filter(n() >= 20) %>% 
+  ungroup()
+
+
+#-----------------------------------------------------------
+# Late data reduced
+#-----------------------------------------------------------
+
+PEPred_late.df <- PEPred.df %>% 
+  mutate(period = "late") %>% 
+  filter(!alt_dem>600,
+         year>year.center.full) %>% 
+  group_by(timeseries)%>%
+  #delete time series with fewer than 20 years
+  filter(n() >= 20) %>% 
+  ungroup()
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+###############################
+## Merge early and late data ##
+###############################
+
+
+
+#-----------------------------------------------------------
+# Reduced data
+#-----------------------------------------------------------
+
+PEPred.df = bind_rows(PEPred.df, PEPred_early.df, PEPred_late.df) %>% 
+  filter(!species %in% c("Larix decidua"))
+# Clean up
+rm(PEPred_early.df, PEPred_late.df)
+
+
+#-----------------------------------------------------------
+# Full data
+#-----------------------------------------------------------
+
+PEP.df = bind_rows(PEP.df, PEP_early.df, PEP_late.df) %>% 
+  # Remove all species that are already present in PEPred.df 
+  # ensures that species with valid 'leaf_off' data are handled exclusively via PEPred.df
+  filter(!species %in% unique(PEPred.df$species))
+# Clean up
+rm(PEP_early.df, PEP_late.df)
+
+
+#-----------------------------------------------------------
+# Merge and scale continuous variables
+#-----------------------------------------------------------
+
+PEP.df = bind_rows(PEP.df, PEPred.df) %>%
+
+  # Group by observation period and site (i.e., timeseries = unique site-location combination)
+  group_by(period, timeseries) %>%
+  
+  # Scale each continuous predictor within each pixel
+  # This removes across-site variation in mean/variance,
+  # ensuring that model coefficients reflect within-site effects over time
+  #
+  # → Why is this important?
+  # Because we're interested in whether interannual variation in predictors
+  # (e.g., temperature, RH) explains interannual shifts in phenology,
+  # not whether warmer sites leaf out earlier on average.
+  
+  # In simple or idealized cases, a random-intercept model may effectively estimate 
+  # a within-site effect even without centering. However, in more complex settings—especially
+  # when predictors differ systematically across groups or are constructed differently across
+  # sites—this is no longer guaranteed, and explicit within–between decomposition becomes 
+  # necessary for clear interpretation.
+
+  # Site-level anomalies of response variable (centered but not scaled)
+  mutate(
+    across(
+      all_of(response_vars), 
+      ~ .x - mean(.x, na.rm = TRUE),
+      .names = "{.col}_anom")) %>%
+  
+  # Site-level scaling of predictor variables
+  mutate(
+    across(
+      all_of(pred_vars), 
+      ~ as.numeric(scale(.x, center = TRUE, scale = TRUE)),
+      .names = "{.col}_z"))
+  
+# Clean up
+rm(PEPred.df)
+```
+
+</details>
+
+<br>
+
+# 2. Check multicollinearity using variance inflation factors (VIFs)
+
+<details>
+
+<summary>Full models</summary>
+
+```{r}
+#==================================================
+# FULL MODELS — Includes all general predictors
+# Adds 'leaf_off' if available for the species
+#==================================================
+
+VIF_full.df <- PEP.df %>%
+  filter(period != "full") %>% 
+  group_by(species) %>%
+  group_modify(~ {
+    data_subset <- .x
+    
+    # Determine if 'leaf_off' is usable for this species
+    include_leaf_off <- any(!is.na(data_subset$leaf_off_z))
+    
+    # Conditionally construct model formula
+    formula <- if (include_leaf_off) {
+      leaf_out_anom ~ leaf_out_prev_z + LSF2 + leaf_off_z + 
+        Tmean.EQ1.SO1_z + Tmean.SO1.EQ2_z + Tmean.EQ2.SO2_z +
+        Tmax_z + RH_z + SWrad_z + year_z
+    } else {
+      leaf_out_anom ~ leaf_out_prev_z + LSF2 +
+        Tmean.EQ1.SO1_z + Tmean.SO1.EQ2_z + Tmean.EQ2.SO2_z +
+        Tmax_z + RH_z + SWrad_z + year_z
+    }
+    
+    #--------------------------------------------------
+    # Fit model and compute VIFs
+    #--------------------------------------------------
+    model <- lm(formula, data = data_subset)
+    vif_vals <- vif(model)
+    
+    # Return tidy VIF output
+    data.frame(
+      Variable = names(vif_vals),
+      VIF = as.numeric(vif_vals)
+    )
+  }) %>%
+  ungroup() %>%
+  
+  # Reshape into wide format: each species gets its own column
+  pivot_wider(names_from = species, values_from = VIF)
+
+# View resulting wide-format VIF table
+VIF_full.df
+```
+
+</details>
+
+<br>
+
+# 3. Run Bayesian hierarchical models
+
+<details>
+
+<summary>Full models</summary>
+
+```{r}
+#-----------------------------------------------------------
+# Define priors
+#-----------------------------------------------------------
+
+priors_brm <- c(
+  # Fixed effects — weakly informative (small shrinkage)
+  set_prior("normal(0, 1)", class = "b"), 
+  
+  # Intercept — mild regularization (helps model intercept stability)
+  set_prior("normal(0, 1)", class = "Intercept"), 
+  
+  # Residual SD (sigma):
+  set_prior("student_t(3, 0, 1)", class = "sigma"),
+  
+  # General SDs for random effects — conservative, heavy tails
+  set_prior("student_t(3, 0, 2.5)", class = "sd"), 
+  
+  # Specific shrinkage for random slope of year by timeseries
+  set_prior("normal(0, 0.5)", class = "sd", group = "timeseries", coef = "year_z"),
+  
+  # Degrees of freedom for Student-t (controls tail heaviness)
+  set_prior("gamma(2, 0.1)", class = "nu")
+)
+
+#-----------------------------------------------------------
+# Define modeling formulae
+#-----------------------------------------------------------
+
+# To account for temporal trends in phenology and potential non-independence of observations across years within each site, 
+# we included year as a random slope grouped by timeseries using an uncorrelated random effects structure (year || timeseries). 
+# This formulation allows both the baseline phenology (intercept) and the temporal trend (slope of year) to vary across sites, 
+# while simplifying model complexity by not estimating the correlation between them.
+#
+# By doing so, we capture spatial heterogeneity in long-term phenological trends and reduce the risk of inflated fixed-effect 
+# estimates caused by unmodeled site-specific trajectories. This specification preserves our ability to detect interannual 
+# relationships between climate predictors and leaf-out timing within sites, while controlling for varying temporal baselines 
+# across locations in a computationally efficient and statistically robust manner.
+
+# Model without leaf_off (used if no data for that variable)
+formula_nolo <- bf(
+  leaf_out_anom ~ leaf_out_prev_z + LSF2 + Tmean.EQ1.SO1_z + Tmean.SO1.EQ2_z + 
+    Tmean.EQ2.SO2_z + Tmax_z + RH_z + SWrad_z + (year_z || timeseries)
+)
+
+# Model including leaf_off (used if data is available for that species)
+formula_lo <- bf(
+  leaf_out_anom ~ leaf_out_prev_z + LSF2 + Tmean.EQ1.SO1_z + Tmean.SO1.EQ2_z + leaf_off_z + 
+    Tmean.EQ2.SO2_z + Tmax_z + RH_z + SWrad_z + (year_z || timeseries)
+)
+
+#-----------------------------------------------------------
+# Setup: model loop across phenological periods and species
+#-----------------------------------------------------------
+
+periods <- c("early", "late")          # Define observation periods
+species_list <- unique(PEP.df$species) # Extract species names
+models <- list()                       # Create empty list to store models
+
+#-----------------------------------------------------------
+# Loop over each period × species combination
+#-----------------------------------------------------------
+
+for (p in periods) {
+  models[[p]] <- list()                # Create sublist for each period
+  
+  for (sp in species_list) {
+    cat("Running model for Period:", p, "| Species:", sp, "\n")
+    
+    # Subset the data for this species and period
+    data_sub <- PEP.df %>% filter(period == p, species == sp)
+    
+    # Skip if there are too few observations for stable estimation
+    if (nrow(data_sub) < 30) {
+      cat("Skipping species due to insufficient data:", sp, "\n")
+      next
+    }
+    
+    #-----------------------------------------------------------
+    # Use different formula depending on whether 'leaf_off' is available
+    #-----------------------------------------------------------
+    
+    include_leaf_off <- any(!is.na(data_sub$leaf_off_z))
+    formula <- if (include_leaf_off) formula_lo else formula_nolo
+    
+    #-----------------------------------------------------------
+    # Fit the model using brms and CmdStanR backend
+    #-----------------------------------------------------------
+    
+    models[[p]][[sp]] <- brm(
+      formula = formula,               # The model formula, chosen dynamically depending on whether 'leaf_off' is available
+      data = data_sub,                 # Subset of data for this species and period
+      #family = gaussian(),            # Specifies a Gaussian likelihood (appropriate for continuous 'leaf_out' response)
+      family  = student(),             # ← THIS IS THE KEY CHANGE
+      prior = priors_brm,              # Priors for intercept, fixed effects, and random effect standard deviations
+      
+      backend = "cmdstanr",            # Use CmdStanR backend for efficient and parallel sampling
+      #init = 0,                       # Initialize all model parameters at 0 (can help avoid divergent transitions early on)
+      
+      chains = 4,                      # Number of MCMC chains to run (default is 4)
+      cores = 12,                      # Number of CPU cores used in total
+      threads = threading(threads = 3),# Run 3 threads per chain (parallelized within-chain sampling; total = 4 × 3 = 12)
+      
+      iter = 4000,                     # Total number of iterations per chain (including warmup)
+      warmup = 1000,                   # Number of warmup (burn-in) iterations per chain
+      
+      control = list(
+        adapt_delta = 0.95,            # Target acceptance probability for the sampler (higher = fewer divergences)
+        max_treedepth = 15             # Maximum depth of the NUTS tree (helps with complex posterior geometry)
+      ),
+      
+      seed = 123                       # Set random seed for reproducibility
+    )
+  }
+}
+
+#-----------------------------------------------------------
+# Save all fitted models to disk
+#-----------------------------------------------------------
+
+saveRDS(models, file = file.path(output.dir, "brms_full_models_studentCenter.rds"))
+```
+
+</details>
+
+<br>
+
+# 4. Reproducibility
+
+<details>
+
+<summary>show</summary>
+
+```{r}
+# Datetime
+Sys.time()
+
+# Session info
+sessionInfo()
+```
+
+</details>

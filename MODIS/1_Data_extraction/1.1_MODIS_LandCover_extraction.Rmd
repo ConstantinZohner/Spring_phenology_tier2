@@ -1,0 +1,198 @@
+---
+title: Spring phenology tier2 project
+author: Constantin Zohner
+date: "last updated 2 March 2025"
+
+subtitle: Extract MODIS land cover map at 0.5° resolution
+output:
+  html_document:
+    highlight: haddock
+    toc: false
+    use_bookdown: true
+    df_print: paged
+    fig_caption: yes
+---
+
+<style>
+body
+  { counter-reset: source-line 0; }
+pre.numberSource code
+  { counter-reset: none; }
+</style>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  class.source = "numberLines lineAnchors"
+  )
+```
+
+<br><br>
+
+## 1. Load packages, set directories, and add functions
+
+<details><summary>get packages</summary>
+```{r, mesage=F, warning=F}
+library(terra)
+library(sf)
+library(dplyr)
+```
+</details>
+
+<details><summary>set directories</summary>
+```{r}
+# path where individual MODIS HDF files are stored
+modis_raw.dir <- "/Users/consti/Desktop/PhD/Data/Global_layers/Ecology_layers/MODIS_LandCover/MCD12Q1_061-20250301_131804"
+
+# path where final map is stored
+modis_out.dir <- "/Users/consti/Desktop/PhD/Data/Global_layers/Ecology_layers/MODIS_LandCover/Maps"
+```
+</details>
+
+<details><summary>add functions</summary>
+```{r}
+# Function to filter MODIS HDF files by year
+############################################
+
+filter_modis_by_year <- function(modis_dir, years) {
+  all_hdf_files <- list.files(path = modis_dir, pattern = "\\.hdf$", full.names = TRUE)
+  
+  # Extract year from filename (A2010, A2018, etc.)
+  hdf_years <- sapply(all_hdf_files, function(f) {
+    match <- regmatches(f, regexpr("A\\d{4}", f))  # Extract "A2018"
+    as.integer(sub("A", "", match))  # Convert "A2018" → 2018
+  })
+  
+  # Filter files based on year
+  filtered_files <- all_hdf_files[hdf_years %in% years]
+  return(filtered_files)
+}
+
+
+# Function to load the relevant MODIS land cover subdataset
+###########################################################
+
+load_modis_hdf <- function(hdf_path, dataset_index = 1) {    
+  sds_list <- terra::sds(hdf_path)
+  modis_raster_all <- terra::rast(sds_list)
+  
+  # Extract the correct dataset (e.g., LC_Type1)
+  modis_raster <- terra::subset(modis_raster_all, dataset_index)
+  return(modis_raster)
+}
+```
+</details>
+
+<br>
+
+## 2. Load, reproject, and downsample land cover map
+
+<details><summary>show code</summary>
+```{r, mesage=F, warning=F}
+# Get all MODIS HDF files for 2010
+modis_2010_files <- filter_modis_by_year(modis_raw.dir, years = 2010)
+
+#-----------------------------------------------------------------------------------------
+
+# Load all MODIS HDF files
+modis_rasters <- lapply(modis_2010_files, load_modis_hdf, dataset_index = 5) # 5 = PFT data (see user guide)
+
+# Remove NULL values (if any)
+modis_rasters <- Filter(Negate(is.null), modis_rasters)
+
+# Merge MODIS rasters into one dataset
+modis_merged <- do.call(terra::mosaic, modis_rasters)
+
+# Plot merged raster (still in Sinusoidal projection)
+plot(modis_merged, main = "Merged MODIS Land Cover (Sinusoidal)")
+
+# -------------------- Reproject to WGS84 --------------------
+
+modis_resampled_wgs84 <- terra::project(modis_merged, "EPSG:4326", method = "near")
+
+# Check resolution & extent after reprojection
+res(modis_resampled_wgs84)
+ext(modis_resampled_wgs84)
+
+# Plot the reprojected raster
+plot(modis_resampled_wgs84, main = "MODIS Land Cover (0.0025° WGS84)")
+
+# -------------------- Change Resolution to 0.5° --------------------
+
+# A) First aggregation to 5km (0.025°) to speed up next steps
+#############################################################
+
+modis_downsampled_5km  <- terra::aggregate(modis_resampled_wgs84, fact = 10, fun = "modal")
+
+# Check resolution
+res(modis_downsampled_5km)
+
+
+# B) Crop to ensure coordinate ranges are within bounds
+#######################################################
+
+# Define the valid extent
+valid_extent <- ext(-180, 180, -90, 90)
+
+# Only crop if the raster is out of valid bounds
+current_extent <- ext(modis_downsampled_5km)
+if (current_extent[1] < -180 || current_extent[2] > 180 || 
+    current_extent[3] < -90 || current_extent[4] > 90) {
+  
+  message("Cropping raster to valid WGS84 extent...")
+  modis_downsampled_5km <- terra::crop(modis_downsampled_5km, valid_extent)
+}
+
+
+# C) Set final resolution to 0.5° (~50 km grid)
+###############################################
+
+final_resolution <- 0.5  # 0.5 degrees ~ 50 km
+
+# Create an empty raster template with desired resolution & extent
+modis_target_grid <- terra::rast(ext=valid_extent, res=final_resolution, crs="EPSG:4326")  # Explicit CRS assignment
+
+# Resample using "mode" (suitable for categorical data)
+modis_downsampled_50km <- terra::resample(modis_downsampled_5km, modis_target_grid, method = "mode")  # correct method for land cover
+
+# Check resolution
+res(modis_downsampled_50km)
+
+# Check extent
+ext(modis_downsampled_50km)
+
+# Plot the final raster
+plot(modis_downsampled_50km, main = "MODIS Land Cover resampled to 0.5° (WGS84)")
+```
+</details>
+
+<br>
+
+## 3. Save final map
+
+<details><summary>show code</summary>
+```{r}
+# Save the final raster as GeoTIFF
+output_filepath <- file.path(modis_out.dir, "MODIS_PFT_2010_WGS84_0.5deg.tif")
+
+terra::writeRaster(modis_downsampled_50km, 
+                   filename = output_filepath, 
+                   filetype = "GTiff", 
+                   overwrite = TRUE)
+
+message("Final MODIS land cover raster saved successfully!")
+```
+</details>
+
+<br>
+
+## 4. Reproducibility 
+
+<details><summary>show code</summary>
+```{r}
+## datetime
+Sys.time()
+
+## session info
+sessionInfo()
+```
+</details>

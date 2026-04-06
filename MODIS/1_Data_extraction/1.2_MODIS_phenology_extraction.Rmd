@@ -1,0 +1,497 @@
+---
+title: Spring phenology tier2 project
+author: Constantin Zohner
+date: "last updated 5 June 2025"
+
+subtitle: Format and clean MODIS data
+output:
+  html_document:
+    highlight: haddock
+    toc: false
+    use_bookdown: true
+    df_print: paged
+    fig_caption: yes
+---
+
+<style>
+body
+  { counter-reset: source-line 0; }
+pre.numberSource code
+  { counter-reset: none; }
+</style>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  class.source = "numberLines lineAnchors"
+  )
+```
+
+<br><br>
+
+## 1. Load packages, set directories, and add functions
+
+<details><summary>get packages</summary>
+```{r, mesage=F, warning=F}
+require(data.table)
+require(tidyverse)
+require(raster)
+require(sf)
+require(ggplot2)
+require(maps)
+require(terra)
+```
+</details>
+
+<details><summary>set directories</summary>
+```{r}
+# paths
+MODISraw.dir  = "/Users/consti/Desktop/PhD/Publication_material/40_Spring_phenology_tier2/MODIS_Analysis/MODIS_data/MODIS_annual"
+MODISout.dir  = "/Users/consti/Desktop/PhD/Publication_material/40_Spring_phenology_tier2/MODIS_Analysis/MODIS_data"
+biome.dir     = "/Users/consti/Desktop/PhD/Data/Global_layers/Ecology_layers/biomes"
+LandCover.dir = "/Users/consti/Desktop/PhD/Data/Global_layers/Ecology_layers/MODIS_LandCover/Maps"
+figure.dir    = "/Users/consti/Desktop/PhD/Publication_material/40_Spring_phenology_tier2/MODIS_Analysis/Analysis_output/LocationMaps"
+```
+</details>
+
+<details><summary>add functions</summary>
+```{r}
+# Define a function to extract quality scores from the QA column
+UnpackDetailedQA <- function(x){
+  bits  <- as.integer(intToBits(x))  # Convert integer to binary bits
+  quals <- sapply(seq(1, 16, by=2), function(i) sum(bits[i:(i+1)] * 2^c(0, 1)))[1:7]
+  return(quals) }
+```
+</details>
+
+<br>
+
+## 2. Load, merge, and revise MODIS phenology data
+
+<details><summary>show code</summary>
+```{r}
+# Phenology data
+################
+
+MODIS.df = list.files(
+  path = MODISraw.dir, # Define the directory containing CSV files
+  pattern = "*.csv", # Look for all CSV files
+  full.names = TRUE  # Use full file paths
+  ) %>% 
+  purrr::map_df(~ {
+    df <- fread(.x)  # Read each CSV file into a dataframe
+    
+    # Extract the year from the filename (e.g., "Phenology_Data_for_Year_2001.csv")
+    year    <- str_extract(basename(.x), "\\d{4}")
+    df$year <- as.integer(year)  # Convert the extracted year to an integer
+    
+    # Apply QA unpacking function to each value in the QA Detailed column
+    if ("QA_Overall_1" %in% names(df)) {  # Check if column exists
+      qa_matrix <- t(sapply(df$QA_Overall_1, UnpackDetailedQA)) # Unpack QA values
+      colnames(qa_matrix) <- c("Greenup_QA", "MidGreenup_QA", "Maturity_QA", "Peak_QA",
+                               "Senescence_QA", "MidGreendown_QA", "Dormancy_QA")
+      df <- cbind(df, qa_matrix)  # Add extracted QA scores to the dataframe
+    }
+    
+    return(df) # Return the processed dataframe
+  }) %>% 
+  
+  # Remove unwanted columns: second cycle data, specific phenological stages, and QA columns
+  dplyr::select(-matches("2"), # Remove all columns containing "2" in their names (second cycle)
+                -QA_Overall_1, -NumCycles, # Remove overall QA and cycle count
+                -Peak_1, -Maturity_1, -Dormancy_1, # Remove specific phenological stages
+                -Peak_QA, -Maturity_QA, -Dormancy_QA) %>% # Remove corresponding QA scores
+  
+  # Rename columns by removing "_1" (ensuring consistency in naming)
+  rename_with(~ gsub("_1", "", .x)) %>% 
+  
+  # Rename spatial columns: x → lon, y → lat
+  rename(lon = x, lat = y) %>%
+  
+  # Remove duplicate records based on unique (lon, lat, year) combinations
+  distinct(lon, lat, year, .keep_all = T) 
+
+# Print first row of the updated MODIS dataset
+MODIS.df[1,]
+```
+</details>
+
+<br>
+
+## 3. Add biome and land cover info
+
+<details><summary>show code</summary>
+```{r}
+# Biome layer
+#############
+
+biome.layers.list <- list.files(
+  path=paste(biome.dir), # Directory containing biome raster files
+  pattern='*.tif',       # Look for all .tif files (adjust if using .asc)
+  full.names=TRUE      # Use full file paths
+) 
+
+# Load the first biome raster
+biome.layer <- rast(biome.layers.list[1])
+
+# Assign categorical colors
+biome_colors <- terrain.colors(n = length(unique(values(biome.layer))))
+
+# Plot with categorical colors
+plot(as.factor(biome.layer), col = biome_colors, main = "Biome Classification", legend = TRUE)
+
+
+# Land cover layer (PFT classification)
+#######################################
+
+LC.layers.list <- list.files(
+  path=paste(LandCover.dir), # Directory containing biome raster files
+  pattern='*.tif',       # Look for all .tif files (adjust if using .asc)
+  full.names=TRUE      # Use full file paths
+) 
+LC.layers.list
+# see MCD12_User_Guide_V61.pdf for details
+#-----------------------------------------
+# MODIS_LandCover_2010_WGS84_0.5deg.tif → Land Cover Type 1 LC Type1 Annual IGBP classification
+# MODIS_PFT_2010_WGS84_0.5deg.tif       → Land Cover Type 5 LC Type5 Annual PFT classification
+#-----------------------------------------
+
+# Define the full file path
+pft_file <- "/Users/consti/Desktop/PhD/Data/Global_layers/Ecology_layers/MODIS_LandCover/Maps/MODIS_PFT_2010_WGS84_0.5deg.tif"
+
+# Load the raster
+LC.layer <- rast(pft_file)
+
+# Assign categorical colors
+LC_colors <- terrain.colors(n = length(unique(values(LC.layer))))
+
+# Plot with categorical colors
+plot(as.factor(LC.layer), col = biome_colors, main = "Land Cover Classification", legend = TRUE)
+
+
+# Ensure MODIS has correct lat/lon column names before conversion
+if (!("lon" %in% names(MODIS.df) & "lat" %in% names(MODIS.df))) {
+  stop("MODIS dataset must contain 'lon' and 'lat' columns")
+}
+
+# Convert MODIS and LC dataframes to a spatial object (sf format)
+MODIS_sf <- st_as_sf(MODIS.df, coords = c("lon", "lat"), crs = crs(biome.layer))
+LC_sf    <- st_as_sf(MODIS.df, coords = c("lon", "lat"), crs = crs(LC.layer))
+
+# Extract biome and LC values at MODIS locations
+MODIS.df$Biome <- terra::extract(biome.layer, MODIS_sf)[,2]  
+MODIS.df$LC    <- terra::extract(LC.layer, MODIS_sf)[,2]  
+
+# Create a new column "ForestType" based on Biome and Land Cover (LC)
+MODIS.df$ForestType <- with(MODIS.df, case_when(
+  
+  LC == 4 & Biome %in% c(4,5,8,10) ~ "Temperate deciduous broadleaf",
+  LC == 4 & Biome %in% c(6,11)     ~ "Boreal deciduous broadleaf",
+  LC == 3                          ~ "Deciduous Needleleaf",
+  
+  TRUE ~ NA_character_  # Assign NA to all other cases
+))
+
+# Filter MODIS data to include only specific biome classifications
+#--------------------------------------
+# Biome Codes:
+# 4  → Temperate Broadleaf/Mixed Forest
+# 5  → Temperate Conifer Forest
+# 8  → Temperate Grassland/Savanna
+# 10 → Montane Grassland/Shrublands
+# 6  → Boreal Forest
+# 11 → Tundra
+#--------------------------------------
+
+# Filter MODIS PFT data to include only specific land cover classifications
+#--------------------------------------
+# Land cover Codes:
+# 3  → Deciduous Needleleaf Trees
+# 4  → Deciduous Broadleaf Trees
+#--------------------------------------
+
+MODIS.df <- MODIS.df %>% 
+  filter(Biome %in% c(4,5,6,8,10,11),
+         LC %in% c(3, 4),
+         lat>0)
+
+# Print first row of the updated MODIS dataset
+MODIS.df[1,]
+```
+</details>
+
+<br>
+
+## 4. Format and clean MODIS data
+
+<details><summary>show code</summary>
+```{r}
+# Filter Greenup data
+MODIS.df <- MODIS.df %>%
+  filter(Greenup > 0 & MidGreenup > 0 &  # Ensure positive values
+         Greenup < MidGreenup &  # Greenup before MidGreenup
+         MidGreenup < Senescence &  # MidGreenup before Senescence
+         Senescence < MidGreendown &  # Senescence before MidGreendown
+         Greenup < 173 &  # Greenup occurs before the summer solstice
+         MidGreenup < 213 &  # MidGreenup before August 1
+         Senescence > 173 &  # Senescence occurs after the summer solstice
+         MidGreendown > 213 & # MidGreendown after August 1
+         Senescence < 365 & MidGreendown < 365)  # Both Senescence & MidGreendown within the year
+
+# Create a dataset for previous year's leaf-out and senescence data
+MODISprev.df <- MODIS.df %>%
+  
+  # Select relevant columns
+  dplyr::select(lon, lat, year, Greenup, MidGreenup, Senescence, MidGreendown) %>%
+  
+  # Shift year forward to match previous year's phenology with the current year
+  mutate(year = year + 1) %>%
+  
+  # Rename phenology columns to indicate previous year values
+  rename(Greenup_prev = Greenup,
+         MidGreenup_prev = MidGreenup,
+         Senescence_prev = Senescence,
+         MidGreendown_prev = MidGreendown)
+
+# Merge previous year data with current data using LEFT JOIN (to avoid data loss)
+MODIS.df <- left_join(MODIS.df, 
+                       MODISprev.df, 
+                       by = c("lon", "lat", "year")) %>%
+  
+  # create pixel identifier
+  mutate(s_id = paste(lat, lon, sep ="_")) %>% 
+  
+  # filter rows lacking phenology data for previous year
+  filter(!is.na(MidGreenup_prev),
+         !is.na(Greenup_prev),
+         !is.na(MidGreendown_prev)) %>%
+  
+  # Group by location (lon, lat)
+  group_by(s_id) %>%
+
+  # Count valid Greenup years per location BEFORE filtering
+  mutate(n.years = sum(!is.na(Greenup))) %>% 
+
+  # Remove pixels with fewer than 10 years of valid data
+  filter(n.years >= 10) %>%  
+  
+  ungroup()
+
+# Print first row of the updated MODIS dataset
+MODIS.df[1,]
+```
+</details>
+
+<br>
+
+## 5. Sample sizes
+
+<details><summary>show code</summary>
+```{r}
+# Total observations
+nrow(MODIS.df)
+
+# How many pixels in total?
+n_distinct(MODIS.df$s_id)
+
+# Time span 
+range(MODIS.df$year)
+paste0("Minimum timeseries length = ",   min(MODIS.df$n.years, na.rm = T),
+       "; Maximum timeseries length = ", max(MODIS.df$n.years, na.rm = T))
+
+# Histograms
+hist(MODIS.df$n.years, xlab="Number of years", main="Time series length", breaks = 30)
+hist(MODIS.df$year, xlab="Year", main="Temporal distribution of data", breaks = 30)
+
+# Latitudinal and longitudinal gradients
+range(MODIS.df$lon)
+range(MODIS.df$lat)
+hist(MODIS.df$lon, xlab="Longitude", main="Longitudinal gradient", breaks = 100)
+hist(MODIS.df$lat, xlab="Latitude",  main="Latitudinal gradient",  breaks = 100)
+
+
+# Distribution of phenology metrics
+###################################
+
+# Define all phenology metrics
+metrics <- c("Greenup", "MidGreenup", "Senescence", "MidGreendown")
+
+for (metric in metrics) {
+  print(paste("Summary for", metric))
+  print(mean(MODIS.df[[metric]], na.rm = TRUE))
+  print(sd(MODIS.df[[metric]], na.rm = TRUE))
+  print(range(MODIS.df[[metric]], na.rm = TRUE))
+  
+  # Histogram for overall distribution
+  hist(MODIS.df[[metric]], 
+       xlab = paste(metric, "date"), 
+       main = paste(metric, "gradient"), 
+       breaks = 100)
+  
+  # Histogram by Forest Type using ggplot2
+  p = ggplot(MODIS.df, aes(x = .data[[metric]])) +
+  geom_histogram(bins = 100, fill = "steelblue", color = "black", alpha = 0.7) +
+  xlab(paste(metric, "Date")) +
+  ylab("Frequency") +
+  ggtitle(paste(metric, "Gradient by Forest Type")) +
+  facet_wrap(~ ForestType, scales = "free_y") +
+  theme_classic()
+  
+  print(p)
+}
+
+
+# Forest type-level statistics
+##############################
+
+# Create summary dataframe per Forest Type
+sample.size = MODIS.df %>%
+  group_by(ForestType) %>% # Group by Forest Type
+  summarize(n.time.series  = n_distinct(lat, lon), # Count unique spatial locations (pixels)
+            n.observations = n()) # Count total observations
+
+# Display sample size summary
+data.frame(sample.size)
+
+# Total time series count
+sum(sample.size$n.time.series)
+
+# Convert wide to long format for visualization
+sample.size <- sample.size %>%
+  pivot_longer(cols = c(n.time.series, n.observations), # Columns to pivot
+               names_to = "Metric",                     # New column for variable names
+               values_to = "Count")                     # New column for values
+
+# Bar Plot for Sample Size
+ggplot(sample.size, aes(x = factor(ForestType), y = Count, fill = Metric)) +  
+  geom_bar(stat = "identity", position = "dodge") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  facet_wrap(~Metric, nrow=2, scales="free_y") +
+  scale_fill_manual(values = c("#1f78b4", "#33a02c")) +
+  labs(x = "Forest Type", y = "Count", fill = "Metric") +
+  theme_classic()
+
+# Temporal coverage per Forest Type
+ggplot(MODIS.df, aes(x = year)) +
+  geom_histogram(position = 'identity', binwidth = 1, fill = "steelblue", color = "black") +
+  facet_wrap(~ForestType, ncol=5, scales = "free_y") +
+  theme_classic() +
+  labs(title = "Temporal Coverage per Forest Type", x = "Year", y = "Count")
+
+
+# Location maps
+###############
+
+# Create base map with world borders
+mapWorld <- borders("world", colour="gray90", fill="gray90") 
+
+# Initialize ggplot with map
+mp <- ggplot() + mapWorld
+
+# Filter unique stations (one per pixel)
+MODIS_unique <- MODIS.df[!duplicated(MODIS.df[, c("lat", "lon")]), ]
+
+
+# Add points for stations, with Biome-based coloring
+mp_all <- mp + 
+  geom_point(data = MODIS_unique, 
+             aes(x = lon, y = lat, color = factor(Biome)),  # Color mapped correctly
+             size = 0.3, shape = 15) +
+  coord_cartesian(ylim = range(MODIS.df$lat), 
+                  xlim = range(MODIS.df$lon)) +
+  xlab("Longitude") + 
+  ylab("Latitude") +
+  theme_classic() +
+  theme(legend.position = c(0.05, 0.25)) +
+  #scale_color_manual(values = c("#e41a1c","#377eb8","#4daf4a","#984ea3")) +  # Optional: Custom biome colors
+  labs(color = "Biome Type")  # Legend label
+
+# Save plot as PDF
+ggsave("AllLocations_biomes.pdf", plot = mp_all, path = figure.dir, width = 16, height = 4)
+
+# Display the map
+mp_all
+
+
+# Add points for stations, with PFT-based coloring
+mp_PFT <- mp + 
+  geom_point(data = MODIS_unique, 
+             aes(x = lon, y = lat, color = factor(LC)),  # Color mapped correctly
+             size = 0.3, shape = 15) +
+  coord_cartesian(ylim = range(MODIS.df$lat), 
+                  xlim = range(MODIS.df$lon)) +
+  xlab("Longitude") + 
+  ylab("Latitude") +
+  theme_classic() +
+  theme(legend.position = c(0.05, 0.25)) +
+  scale_color_manual(values = c("#4daf4a","#377eb8")) +  # Optional: Custom biome colors
+  labs(color = "PFT")  # Legend label
+
+# Save plot as PDF
+ggsave("AllLocations_PFT.pdf", plot = mp_PFT, path = figure.dir, width = 16, height = 4)
+
+# Display the map
+mp_PFT
+
+
+# Add points for stations, with forest type-based coloring
+mp_type <- mp + 
+  geom_point(data = MODIS_unique, 
+             aes(x = lon, y = lat, color = ForestType),  # Color mapped correctly
+             size = 0.3, shape = 15) +
+  coord_cartesian(ylim = range(MODIS.df$lat), 
+                  xlim = range(MODIS.df$lon)) +
+  xlab("Longitude") + 
+  ylab("Latitude") +
+  theme_classic() +
+  theme(legend.position = c(0.08, 0.25)) +
+  scale_color_manual(values = c("#e41a1c","#377eb8","#4daf4a")) +  # Optional: Custom biome colors
+  labs(color = "PFT")  # Legend label
+
+# Save plot as PDF
+ggsave("AllLocations_forest_type.pdf", plot = mp_type, path = figure.dir, width = 16, height = 4)
+
+# Display the map
+mp_type
+```
+</details>
+
+<br>
+
+## 6. Safe final tables
+
+<details><summary>show code</summary>
+```{r}
+# Order and select relevant columns
+MODIS.df = MODIS.df %>% 
+  dplyr::select(year, s_id, lat, lon, Biome, LC, ForestType,
+                Greenup, Greenup_QA, MidGreenup, MidGreenup_QA,
+                Greenup_prev, MidGreenup_prev, Senescence_prev, MidGreendown_prev)
+
+# Print the first row to check
+MODIS.df[1,]
+
+# Save the cleaned MODIS table
+write.csv(MODIS.df, paste(MODISout.dir, "MODIS_data_clean.csv", sep="/"), row.names = FALSE)  
+
+# Extract unique coordinates
+MODIS_data_coordinates = MODIS.df %>% 
+  distinct(s_id, lat, lon, .keep_all = F)
+
+# Save the unique coordinates table
+write.csv(MODIS_data_coordinates, paste(MODISout.dir, "MODIS_coordinates.csv", sep="/"), row.names = FALSE)  
+```
+</details>
+
+<br>
+
+## 7. Reproducibility 
+
+<details><summary>show code</summary>
+```{r}
+## datetime
+Sys.time()
+
+## session info
+sessionInfo()
+```
+</details>

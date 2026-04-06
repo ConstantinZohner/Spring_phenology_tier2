@@ -1,0 +1,479 @@
+---
+title: "Spring phenology tier2 project"
+subtitle: "Model performance figures (PEP725 data)"
+author: "Constantin Zohner"
+date: "Last run: `r format(Sys.Date(), '%d %B %Y')`"
+
+format:
+  html:
+    toc: false
+    theme: default
+    highlight-style: haddock
+    df-print: paged
+    embed-resources: true
+
+execute:
+  #warning: false
+  message: false
+  echo: true
+  output: true
+
+always_allow_html: true
+editor: visual
+editor_options:
+  chunk_output_type: inline
+---
+
+<br>
+
+### Driver names
+
+-   Tmin: Minimum daily temperature
+-   Tmax: Maximum daily temperature
+
+<br>
+
+# 1. Setup
+
+<details>
+
+<summary>Packages</summary>
+
+```{r, message=FALSE, warning=FALSE}
+require(data.table)
+require(dplyr)
+require(pbmcapply)
+require(chillR)
+require(zoo)
+```
+
+</details>
+
+<details>
+
+<summary>Functions</summary>
+
+```{r}
+#-------------------------------------------------------
+# Chilling and GDD calculation
+#-------------------------------------------------------
+
+# Chilling units
+Chill.fun = function(Temp, threshold_low, threshold_up){
+  if(between(Temp,threshold_low, threshold_up)) {CU=1} else {CU=0}
+  return(CU)
+}
+
+# Forcing units
+GDD.fun = function(Temp, threshold_low){
+  if(Temp >= threshold_low) {GDD=Temp-threshold_low} else {GDD=0}
+  return(GDD)
+}
+
+
+#-------------------------------------------------------
+# Photoperiod model
+#-------------------------------------------------------
+
+# Function for photoperiod sensitivity with different k and p values
+photoperiod_response <- function(DL, k, p) {
+  DL_adjusted <- pmax(DL - 6, 0)  # Shift DL so that it starts at 6 hours instead of 0
+  f_DL <- (log(1 + k * DL_adjusted) / log(1 + k * (20 - 6)))^p  # Normalize to DL = 20
+  f_DL <- pmin(f_DL, 1)  # Cap at 1 from DL = 20 to 24
+  return(f_DL)
+}
+
+
+#-------------------------------------------------------
+# Chilling model
+#-------------------------------------------------------
+
+# Function for chilling dependency scaling factor
+chilling_response <- function(Chilling, requirement) {
+  factor <- pmin(Chilling / requirement, 1)  # chilling dependency reaches 1 at X chill days
+  return(factor)
+}
+# Chilling = actual chilling unit 
+# requirement = total chilling requirement (in days), i.e., after how many chill days is chilling completely fulfilled?
+
+
+#-------------------------------------------------------
+# Function to compute adjusted GDDs #
+#-------------------------------------------------------
+
+adjust_gdd <- function(GDD, Chilling, requirement=150, include_photo = F, DL = NULL, k = 1, p = 1) {
+  f_Chill <- chilling_response(Chilling, requirement)
+  
+  if (include_photo) {
+    if (is.null(DL)) stop("DL must be provided when include_photo is TRUE")
+    f_Photo <- photoperiod_response(DL, k, p)
+    GDD_adjusted <- GDD * f_Chill * f_Photo
+  } else {
+    GDD_adjusted <- GDD * f_Chill
+  }
+  
+  return(GDD_adjusted)
+}
+
+
+#-------------------------------------------------------
+# Replace NAs with neighbor values through interpolation
+#-------------------------------------------------------
+
+replace_na_with_neighbor_mean <- function(x) {
+  if (!is.numeric(x)) return(x)
+  if (all(is.na(x))) return(x)
+  return(na.approx(x, na.rm = FALSE, rule = 2))
+}
+
+
+#-------------------------------------------------------
+# Leave-one-out mean
+#-------------------------------------------------------
+
+# LOO mean that ignores NAs, returns NA if only one non-NA in group
+loo_vec <- function(v){
+  nn <- sum(!is.na(v)); ss <- sum(v, na.rm = TRUE)
+  if (nn <= 1) return(rep(NA_real_, length(v)))
+  res <- (ss - v) / (nn - 1)
+  res[is.na(v)] <- ss/nn
+  res
+}
+
+
+#-------------------------------------------------------
+# Find date when GDD threshold is reached
+#-------------------------------------------------------
+
+# Return the 1-based index of the **first** element in `x` that is >= `thr`.
+# If no such element exists (or inputs are empty/invalid), return NA_integer_.
+# - `x` can contain NAs → they are ignored (do not match the condition).
+# - Works for any numeric vector; no sorting assumption required.
+first_ge <- function(x, thr) { 
+  # Guard against empty x or undefined threshold
+  if (length(x) == 0L || is.na(thr)) return(NA_integer_)
+  
+  # Which positions satisfy x >= thr? Take the first match.
+  # If none match, `which(...)` is integer(0) and `[1]` yields NA.
+  idx <- which(x >= thr)[1]
+  
+  # Normalize to an integer NA when there was no match
+  if (is.na(idx)) NA_integer_ else idx
+  }
+```
+
+</details>
+
+<details>
+
+<summary>Directories</summary>
+
+```{r}
+#-------------------------------------------------
+# Define the base directory
+#-------------------------------------------------
+
+base.dir <- "/Users/goalie/Desktop/PhD/Publication_material/40_Spring_phenology_tier2/PEP725_Analysis/Analysis_input"
+
+
+#-------------------------------------------------
+# Build specific directories from the base
+#-------------------------------------------------
+
+# Climate
+EOBS.dir = file.path(base.dir, "EOBS_data")
+
+# Photoperiod
+photo.dir = file.path(base.dir, "Photoperiod")
+
+# Phenology
+PEP.dir = file.path(base.dir, "PEP_drivers_final_spring/Merged_file")
+
+# Output
+PEP_drivers.dir = file.path(base.dir, "PEP_models")
+```
+
+</details>
+
+<details>
+
+<summary>Load and prepare data</summary>
+
+```{r}
+#-------------------------------------------------------
+# Phenology data
+#-------------------------------------------------------
+
+PEP.df <- fread(paste(PEP.dir, "pep_drivers_spring_data.csv", sep="/")) %>% 
+  # select columns
+  dplyr::select(c(s_id, species, timeseries, year, lat, lon, leaf_out,
+                  GDD, GDD.chill.lo, GDD.chill.hi, GDD.chill.DL)) %>% 
+  # Mean GDD sums for each timeseries
+  group_by(s_id, species, timeseries) %>% 
+  # keep series ≥20 years
+  filter(n() >= 20) %>% 
+  # Leave-one-out mean GDDs
+  mutate(across(c(GDD, GDD.chill.lo, GDD.chill.hi, GDD.chill.DL),
+                ~loo_vec(.x))) %>%
+  ungroup() %>% 
+  # create identifier columns
+  mutate(site_year = paste0(s_id, "_", year),       # Identifier 1 (site x year combinations)
+         ts_yr     = paste0(timeseries, "_", year)) # Identifier 2 (timeseries x year combinations)
+
+
+#-------------------------------------------------------
+# Photoperiod
+#-------------------------------------------------------
+
+photo.df = fread(paste(photo.dir, "Photoperiod.csv", sep="/"))
+
+
+#-------------------------------------------------------
+# Daily climatic datasets from EOBS
+#-------------------------------------------------------
+
+#define climate variables
+list.files(EOBS.dir)
+vn <- c("tn_ens_mean_0.1deg_reg_v30.0e.csv", # daily minimum temperature
+        "tx_ens_mean_0.1deg_reg_v30.0e.csv") # daily maximum temperature
+
+# Read into named list
+DataList <- lapply(file.path(EOBS.dir, vn), fread)
+
+
+#-------------------------------------------------------
+# Merge data and add names to list
+#-------------------------------------------------------
+
+# Add additional datasets
+DataList[[length(DataList) + 1]] <- photo.df
+DataList[[length(DataList) + 1]] <- PEP.df
+
+# Set all names
+names(DataList) = c(vn, "photoperiod", "PEP")
+names(DataList)
+
+# remove individual tables
+rm(photo.df, PEP.df)
+```
+
+</details>
+
+<br>
+
+# 2. Parallel computing
+
+<details>
+
+<summary>Create loop</summary>
+
+```{r, message=FALSE, warning=FALSE}
+###########################################################
+# Loop through each observations using parallel computing #
+###########################################################
+
+
+
+# Define unique timeseries-year combinations
+timeseries_year  = unique(DataList[["PEP"]]$ts_yr)
+
+# Parallel processing function
+parallelCalc <- function(timeseries_years, DataList) {
+  
+  #-------------------------------------------------------------
+  # extract PEP data per timeseries x year combination
+  #-------------------------------------------------------------
+  
+  pheno.sub  <- DataList[["PEP"]][which(DataList[["PEP"]]$ts_yr==timeseries_years),]
+  # Skip if doesn't exist
+  if (nrow(pheno.sub) == 0) return(NULL)
+  
+  
+  #-------------------------------------------------------------
+  # Define the length of the period of interest in calendar units
+  #-------------------------------------------------------------
+  
+  year2     <- pheno.sub$year[1]
+  year1     <- year2 - 1L
+  start_doy <- sprintf("%d-01-01", year1)
+  end_doy   <- sprintf("%d-06-30", year2)
+  days      <- seq(as.Date(start_doy), as.Date(end_doy), by="days")
+  
+  #get number of days in year 1 and year 2
+  days_year1 <- length(seq(as.Date(start_doy), as.Date(paste(year1,"-12-31", sep="")), by="days"))
+  days_year2 <- length(seq(as.Date(paste0(year2,"-01-01")), as.Date(end_doy), by="days"))
+  
+  
+  #-------------------------------------------------------------
+  # Load and merge all climate variables
+  #-------------------------------------------------------------
+  
+  # Function to load climate data
+  get_subdata <- function(var_index) {
+      # Year 1
+      sub1 <- DataList[[var_index]][DataList[[var_index]]$s_id == pheno.sub$s_id &
+                                      DataList[[var_index]]$year == year1, as.character(1:days_year1), with = FALSE]
+      # Year 2
+      sub2 <- DataList[[var_index]][DataList[[var_index]]$site_year == pheno.sub$site_year, as.character(1:days_year2), with = FALSE]
+      if (nrow(sub1) == 0 || nrow(sub2) == 0) return(NULL)
+      cbind(sub1, sub2)
+    }
+  
+  # ------------------------------------------------------------------------
+  # Short Name        ; Long Name                               ; Unit [d-1]
+  # ------------------------------------------------------------------------
+  # TMIN              ; Minimum Air Temperature                 ; degC
+  # TMAX              ; Maximum Air Temperature                 ; degC
+  # ------------------------------------------------------------------------
+  
+  Tmin  <- get_subdata(1)
+  Tmax  <- get_subdata(2)
+  
+  DL    <- cbind(
+      DataList[["photoperiod"]][DataList[["photoperiod"]]$lat == pheno.sub$lat, as.character(1:days_year1), with = FALSE][1,],
+      DataList[["photoperiod"]][DataList[["photoperiod"]]$lat == pheno.sub$lat, as.character(1:days_year2), with = FALSE][1,]
+    )
+  
+ if (any(sapply(list(Tmin, Tmax, DL), is.null))) {
+      return(NULL)
+    }
+  
+  
+  #-------------------------------------------------------------
+  # Table of climate variables
+  #-------------------------------------------------------------
+    
+  daily_vals <- data.frame(
+    Year  = lubridate::year(days),
+    Month = lubridate::month(days),
+    Day   = lubridate::day(days),
+    Tmin  = as.numeric(unlist(Tmin, use.names = FALSE)),
+    Tmax  = as.numeric(unlist(Tmax, use.names = FALSE)),
+    DL    = as.numeric(unlist(DL, use.names = FALSE))) %>% 
+    #replace NAs with neighbor mean
+    mutate(across(c(Tmin, Tmax, DL), replace_na_with_neighbor_mean))
+  
+    
+  #-------------------------------------------------------------
+  # Generate sub-dataframe to store results
+  #-------------------------------------------------------------
+    
+  factors.sub <- pheno.sub %>% dplyr::select(s_id,species,timeseries,year,leaf_out)
+    
+    
+  #-------------------------------------------------------------
+  # Shortest day of year
+  #-------------------------------------------------------------
+  
+  solstice = which(daily_vals$DL==min(daily_vals$DL, na.rm = T))[1] 
+  if (is.na(solstice)) return(NULL)
+  
+
+  #-------------------------------------------------------------
+  # Add chilling and GDD
+  #-------------------------------------------------------------
+    
+  #Get hourly values
+  hourly_vals = stack_hourly_temps(daily_vals, latitude=pheno.sub$lat)$hourtemps
+    
+  # Chilling and Forcing hours
+  Chill_days = hourly_vals %>%
+    #add Chilling and Forcing units
+    mutate(Chill = sapply(Temp, Chill.fun, threshold_low=-10, threshold_up=10),
+           GDD   = sapply(Temp, GDD.fun,   threshold_low=5)) %>%
+    #summarise daytime hours
+    group_by(Year, Month, Day) %>%
+    summarise(Chill = mean(Chill, na.rm=T),
+              GDD   = mean(GDD, na.rm=T))%>%
+    ungroup() %>%
+    #order
+    dplyr::select(Chill, GDD) 
+    
+  # define November first as start date of chilling accumulation
+  start_row <-  which(daily_vals$Month==11 & daily_vals$Day==1)  
+    
+  # Cbind
+  daily_vals = cbind(daily_vals, Chill_days) %>%
+    mutate(
+      #continous count from Jan 1
+      id = row_number(),
+      # Sum chilling days from 1 November
+      Chill_sum = ifelse(id < start_row, 0, cumsum(ifelse(id >= start_row, Chill, 0))),
+      # Add chilling/photoperiod-adjusted GDDs
+      GDD.chill.lo = adjust_gdd(GDD=GDD, Chilling=Chill_sum, requirement=75),
+      GDD.chill.hi = adjust_gdd(GDD=GDD, Chilling=Chill_sum, requirement=150),
+      GDD.chill.DL = adjust_gdd(GDD=GDD, Chilling=Chill_sum, requirement=150, include_photo = T, DL = DL)) %>% 
+    #order
+    dplyr::select(id, Year, Month, Day,
+                  GDD, GDD.chill.lo, GDD.chill.hi, GDD.chill.DL) %>% 
+    #calculate GDD sums from winter solstice
+    filter(id >= solstice) %>% 
+    mutate(GDD          = cumsum(GDD),
+           GDD.chill.lo = cumsum(GDD.chill.lo),
+           GDD.chill.hi = cumsum(GDD.chill.hi),
+           GDD.chill.DL = cumsum(GDD.chill.DL)) %>% 
+    #delete days of previous year
+    filter(Year != as.integer(year1)) 
+    
+
+  #-------------------------------------------------------------
+  # Predict leaf-out dates
+  #-------------------------------------------------------------
+
+  factors.sub = factors.sub %>% 
+      mutate(leaf_out_GDD          = first_ge(daily_vals$GDD,          pheno.sub$GDD),
+             leaf_out_GDD.chill.lo = first_ge(daily_vals$GDD.chill.lo, pheno.sub$GDD.chill.lo),
+             leaf_out_GDD.chill.hi = first_ge(daily_vals$GDD.chill.hi, pheno.sub$GDD.chill.hi),
+             leaf_out_GDD.chill.DL = first_ge(daily_vals$GDD.chill.DL, pheno.sub$GDD.chill.DL))
+  
+  
+  #-------------------------------------------------------------
+  # Safe the table   
+  #-------------------------------------------------------------
+  
+  return(factors.sub)
+    
+}
+```
+
+</details>
+
+<details>
+
+<summary>Run loop and safe data</summary>
+
+```{r}
+#-------------------------------------------------------------
+# Run in parallel
+#-------------------------------------------------------------
+
+outputlist <- pbmclapply(timeseries_year, function(y) parallelCalc(y, DataList), mc.cores = 12, mc.preschedule = T)
+climate.factors.df <- rbindlist(outputlist, fill=T)
+
+
+#-------------------------------------------------------------
+# Save results
+#-------------------------------------------------------------
+
+write.csv(climate.factors.df, paste(PEP_drivers.dir, "pep_model_predictions_LOO.csv", sep="/"))
+```
+
+</details>
+
+<br>
+
+# 3. Reproducibility
+
+<details>
+
+<summary>show</summary>
+
+```{r}
+# Datetime
+Sys.time()
+
+# Session info
+sessionInfo()
+```
+
+</details>

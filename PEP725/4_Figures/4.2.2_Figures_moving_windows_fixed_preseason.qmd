@@ -1,0 +1,643 @@
+---
+title: "Spring phenology tier2 project"
+subtitle: "Moving window figures for fixed preseasons (PEP725 data)"
+author: "Constantin Zohner"
+date: "Last run: `r format(Sys.Date(), '%d %B %Y')`"
+
+format:
+  html:
+    toc: false
+    theme: default
+    highlight-style: haddock
+    df-print: paged
+    embed-resources: true
+
+execute:
+  #warning: false
+  message: false
+  echo: true
+  output: true
+
+always_allow_html: true
+editor: visual
+editor_options:
+  chunk_output_type: inline
+---
+
+<br>
+
+### Model names
+
+-   St_abs: Absolute model (days per °C)
+-   St_log: log-log transformation
+-   St_z: log-log + z-scaled predictor
+
+<br>
+
+### Preseason definitions
+
+-   PS60: Mean daily maximum temperature 60 days prior to series-level mean leaf-out
+-   PSfix: Mean daily maximum temperature 60 days prior to species-level mean leaf-out
+
+<br>
+
+# 1. Setup
+
+<details>
+
+<summary>Packages</summary>
+
+```{r, message = F}
+require(tidyverse)
+require(data.table)
+require(ggplot2)
+require(broom)
+```
+
+</details>
+
+<details>
+
+<summary>Directories</summary>
+
+```{r}
+#-------------------------------------------------
+# Define the base directory
+#-------------------------------------------------
+
+base.dir <- "/Users/goalie/Desktop/PhD/Publication_material/40_Spring_phenology_tier2/PEP725_Analysis"
+
+
+#-------------------------------------------------
+# Build specific directories from the base
+#-------------------------------------------------
+
+# Moving window model results
+MW_model.dir    = file.path(base.dir, "Analysis_output/ModelResults/Moving_window_analysis/Individual_files_fixed_preseason_models")
+
+# Output
+output.dir = file.path(base.dir, "Analysis_output/ModelFigures/Moving_windows/St_fixed_preseason")
+```
+
+</details>
+
+<details>
+
+<summary>Plot theme</summary>
+
+```{r}
+plotTheme1 = theme(legend.position   = "right",
+                   legend.background = element_rect(fill=NA, linewidth=0.5, linetype="solid"),
+                   legend.text       = element_text(color="black",face = "italic"),
+                   panel.grid.major  = element_blank(),
+                   panel.grid.minor  = element_blank(),
+                   panel.background  = element_blank(),
+                   panel.border      = element_rect(colour = "black", fill=NA),
+                   axis.line         = element_line(color = "black"),
+                   axis.text         = element_text(colour = "black"),
+                   axis.text.x       = element_text(angle = 45, hjust=1),
+                   strip.background  = element_rect(fill=NA),
+                   plot.title        = element_text(face="bold"))
+```
+
+</details>
+
+<details>
+
+<summary>Functions</summary>
+
+```{r}
+#-------------------------------------------------------
+# lower (lo) and upper (hi) confidence intervals of mean
+#-------------------------------------------------------
+
+lo <- function(x){
+  x <- x[is.finite(x)]
+  if (length(x) < 2) return(NA_real_)
+  t.test(x, conf.level = 0.95)$conf.int[1]
+}
+
+hi <- function(x){
+  x <- x[is.finite(x)]
+  if (length(x) < 2) return(NA_real_)
+  t.test(x, conf.level = 0.95)$conf.int[2]
+}
+
+
+#-------------------------------------------------------
+# Standard error of the mean
+#-------------------------------------------------------
+
+stderror <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) < 2) return(NA_real_)
+  sd(x) / sqrt(length(x))
+}
+```
+
+</details>
+
+<details>
+
+<summary>Data</summary>
+
+```{r}
+#-------------------------------------------------------
+# Moving window model data
+#-------------------------------------------------------
+
+model.df <- rbindlist(
+  lapply(
+    list.files(path = MW_model.dir, pattern = "\\.csv$", full.names = TRUE),
+    fread),
+  fill = TRUE) %>% 
+  
+  # transform sign of coefficients
+  mutate(estimate = -1 * estimate)
+```
+
+</details>
+
+<br>
+
+# 2. Summarize models
+
+<details>
+
+<summary>Show</summary>
+
+```{r, message=F}
+#-------------------------------------------------------
+# Create tables for absolute and relative metrics
+#-------------------------------------------------------
+
+# Absolute metrics (coefficients & correlations)
+#-----------------------------------------------
+metrics_abs_long <- model.df %>%
+  # keep the identifying columns you need
+  dplyr::select(
+    phenology, equation, species, timeseries, MWyear,
+    estimate, cor_xy
+  ) %>%
+  # pivot the metrics you want to baseline-normalize
+  tidyr::pivot_longer(
+    cols = c(estimate, cor_xy),
+    names_to  = "metric",
+    values_to = "value"
+  ) %>%
+  dplyr::mutate(scale = "absolute")
+
+# Relative metrics (coefficients, SDs, and variance ratios)
+#----------------------------------------------------------
+metrics_rel_long <- model.df %>%
+  # keep the identifying columns you need
+  dplyr::select(phenology, equation, species, timeseries, MWyear, 
+                estimate, sd_x, sd_y, var_ratio) %>%
+  # pivot the metrics you want to baseline-normalize
+  tidyr::pivot_longer(
+    cols = c(estimate, sd_x, sd_y, var_ratio),
+    names_to  = "metric",
+    values_to = "value_abs"
+  ) %>%
+  # create baseline and calculate relative metric
+  group_by(phenology, equation, species, metric) %>%
+  mutate(
+    base  = mean(value_abs, na.rm = TRUE),
+    value = 100 * (value_abs / base - 1)
+  ) %>% 
+  ungroup() %>% 
+  dplyr::select(-value_abs, -base)%>%
+  dplyr::mutate(
+    metric = paste0(metric, "_rel"),
+    scale = "relative")
+
+# Anomaly metrics (leaf-out and temperature means)
+#----------------------------------------------------------
+metrics_anom_long <- model.df %>%
+  # keep the identifying columns you need
+  dplyr::select(phenology, equation, species, timeseries, MWyear, 
+                mean_x, mean_y) %>%
+  
+  # pivot the metrics you want to baseline-normalize
+  tidyr::pivot_longer(
+    cols = c(mean_x, mean_y),
+    names_to  = "metric",
+    values_to = "value_abs"
+  ) %>%
+  # create baseline and calculate anomaly
+  group_by(phenology, equation, species, metric) %>%
+  mutate(
+    base  = mean(value_abs, na.rm = TRUE),
+    value = value_abs - base
+  ) %>%
+  ungroup() %>% 
+  dplyr::select(-value_abs, -base)%>%
+  dplyr::mutate(
+    metric = paste0(metric, "_anom"),
+    scale = "anomaly")
+
+# Bind everything into one long table
+#------------------------------------
+metrics_long <- dplyr::bind_rows(
+  metrics_abs_long,
+  metrics_rel_long,
+  metrics_anom_long
+)
+
+
+#-------------------------------------------------------
+# 3. Summarize at species × MWyear × metric
+#-------------------------------------------------------
+
+model.summary.df <- metrics_long %>%
+  group_by(phenology, equation, species, MWyear, metric, scale) %>%
+  summarize(
+    mean = mean(value, na.rm = TRUE),
+    lo   = lo(value),
+    hi   = hi(value),
+    .groups = "drop"
+  )
+
+
+#-------------------------------------------------------
+# 4. Summarize at MWyear × metric
+#-------------------------------------------------------
+
+model.summary.all.df <- model.summary.df %>%
+  group_by(phenology, equation, MWyear, metric, scale) %>%
+  summarize(
+    mean_all = mean(mean, na.rm = TRUE),
+    lo       = lo(mean),
+    hi       = hi(mean),
+    .groups  = "drop"
+  )
+```
+
+</details>
+
+<br>
+
+# 3. Leaf-out model plots
+
+<details>
+
+<summary>Model coefficients</summary>
+
+```{r, warning=F, message=F}
+#-------------------------------------------------------
+# Linear model coefficients of metric change over time
+#-------------------------------------------------------
+
+linear.trends.df <- model.summary.all.df %>%
+  
+  # 1) Define the grouping for which you want *one* trend each
+  group_by(phenology, equation, metric) %>%
+  
+  # 2) Fit one linear model per group and store it as a list-column.
+  summarise(
+    model = list(lm(mean_all ~ MWyear, data = pick(MWyear, mean_all))),
+    .groups = "drop"   # drop grouping after summarise
+  ) %>%
+  
+  # 3) Extract model results into two standard broom tables:
+  mutate(tidied  = purrr::map(model, broom::tidy)) %>%
+  dplyr::select(-model) %>%   # We no longer need the raw model objects
+  
+  # 4) Expand the "tidied" list-column so you get one row per model term
+  tidyr::unnest(tidied) %>%
+  
+  # 5) Keep only the slope term (drop the intercept row)
+  filter(term == "MWyear") %>%
+  
+  # 6) Rename to your preferred names
+  rename(slope = estimate, se = std.error, pval = p.value) %>%
+  
+  # 7) Build an annotation label (and provide x/y placement defaults for geom_text)
+  mutate(
+    
+    # significance labeling
+    p_lab = case_when(
+      pval < 0.001 ~ "***",
+      pval < 0.01  ~ "**",
+      pval < 0.05  ~ "*",
+      TRUE         ~ sprintf("p = %.2f", pval)
+    ),
+    
+    # ---- Units logic ----
+    unit = dplyr::case_when(
+      metric == "estimate" ~ "St per year",
+      metric == "cor_xy"   ~ "per year",
+      
+      # Any metric name containing "rel" -> percent per year
+      stringr::str_detect(metric, "rel") ~ "% per year",
+      
+      # mean_x_anom special-cases
+      metric == "mean_x_anom" & equation == "St_abs" ~ "\u00B0C per year",
+      metric == "mean_x_anom" & equation != "St_abs" ~ "per year",
+      
+      # mean_y_anom special-cases
+      metric == "mean_y_anom" & equation == "St_abs" ~ "days per year",
+      metric == "mean_y_anom" & equation != "St_abs" ~ "per year",
+      
+      # Fallback (in case new metrics appear)
+      TRUE ~ "per year"
+    ),
+    
+    # label text shown on plots
+    label = sprintf("trend: %.3f \u00B1 %.3f %s %s", slope, 2 * se, unit, p_lab)
+  ) %>%
+  
+  # 8) Keep only what you need for joining/filtering + plotting annotation
+  dplyr::select(phenology, equation, metric, slope, se, pval, label)
+
+linear.trends.df
+```
+
+</details>
+
+<details>
+
+<summary>Relative Ts change (Fig. Sx)</summary>
+
+```{r, warning=F, message=F}
+#===============================================================================
+# Relative decline in temperature sensitivity (St) from early → late moving windows
+#   - Computes mean St per species × equation × phenology for:
+#       (i) earliest 15 moving windows  = "early"
+#      (ii) latest   15 moving windows  = "late"
+#   - Returns relative decline (%) = 100 * (St_early - St_late) / St_early
+#   - Plots distributions across species as violin + boxplot + jittered points
+#===============================================================================
+
+
+#------------------------------------------------------
+# 1) Define time windows
+#------------------------------------------------------
+
+mw_min <- min(model.summary.df$MWyear, na.rm = TRUE)
+mw_max <- max(model.summary.df$MWyear, na.rm = TRUE)
+
+early <- mw_min:(mw_min + 14)   # earliest 15 moving windows
+late  <- (mw_max - 14):mw_max   # latest 15 moving windows
+
+
+#------------------------------------------------------
+# 2) Phenology model ordering + plot labels + colors
+#------------------------------------------------------
+
+phen_order <- c(
+  "leaf_out",
+  "leaf_out_GDD",
+  "leaf_out_GDD.chill.lo",
+  "leaf_out_GDD.chill.hi",
+  "leaf_out_GDD.chill.DL"
+)
+
+phen_labels <- c(
+  leaf_out              = "Observations",
+  leaf_out_GDD          = "Forcing-only",
+  leaf_out_GDD.chill.lo = "Low chilling",
+  leaf_out_GDD.chill.hi = "High chilling",
+  leaf_out_GDD.chill.DL = "High chilling + Daylength"
+)
+
+
+#------------------------------------------------------
+# 3) Compute relative decline in St (species-level)
+#------------------------------------------------------
+
+relative.Ts.df <- model.summary.df %>%
+  # keep only early/late windows, target equations, and target model variants
+  filter(
+    MWyear %in% c(early, late),
+    metric == "estimate",
+    phenology %in% phen_order
+  ) %>%
+  # classify MWyear into early vs late
+  mutate(period = ifelse(MWyear %in% early, "early", "late")) %>%
+  # average across the 15 moving windows within each period
+  group_by(species, equation, phenology, period) %>%
+  summarise(St = mean(mean, na.rm = TRUE), .groups = "drop") %>%
+  # reshape to have columns early and late
+  pivot_wider(names_from = period, values_from = St) %>%
+  # drop incomplete pairs (and avoid division by zero)
+  filter(!is.na(early), !is.na(late), early != 0) %>%
+  mutate(
+  change_pct = 100 * (late / early -1),  # 0 = no change; + = increase; - = decrease
+  # enforce consistent ordering in plot
+  phenology = factor(phenology, levels = phen_order),
+  equation  = factor(equation, levels = c("St_PS60_abs", "St_PS60_log", "St_PS60_z",
+                                          "St_PSfix_abs", "St_PSfix_log", "St_PSfix_z"))
+  ) %>%
+  arrange(species, equation, phenology)
+
+# panel letters (placed manually in the upper-left of each facet)
+panel_labs <- tibble(
+  equation = factor(c("St_PS60_abs", "St_PS60_log", "St_PS60_z",
+                      "St_PSfix_abs", "St_PSfix_log", "St_PSfix_z"), 
+                    levels = levels(relative.Ts.df$equation)),
+  lab      = c("a", "b", "c", "d", "e", "f")
+)
+
+
+#------------------------------------------------------
+# 4) Plot: box + species points, faceted by equation
+#------------------------------------------------------
+
+plot.relative.St <- ggplot(relative.Ts.df, aes(x = phenology, y = change_pct)) +
+
+  # Reference: 100% = no change
+  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.4) +
+
+  # Make all distributions grey (no phenology fill)
+  #geom_violin(trim = TRUE, alpha = 0.85, fill = "grey85", color = NA) +
+  geom_boxplot(width = 0.4, outlier.shape = NA, 
+               fill = "grey90", color = "grey30") +
+
+  # Color points by species (manual palette)
+  geom_point(
+  aes(color = species),
+  position = position_jitter(width = 0.18, height = 0),
+  size = 1.5, alpha = 0.85) +
+
+  facet_wrap(~ equation, nrow = 2, scales = "fixed") +
+
+  # Panel letters a / b (upper-left)
+  geom_text(
+    data = panel_labs,
+    aes(x = -Inf, y = Inf, label = lab),
+    inherit.aes = FALSE,
+    hjust = -0.2, vjust = 1.2, fontface = "bold", size = 5
+  ) +
+
+  # Rename phenology classes on x-axis
+  scale_x_discrete(labels = phen_labels) +
+
+  # Manual species color palette (10 species)
+  scale_color_manual(
+    "Species",
+    values = c('#a6cee3','#1f78b4','#b2df8a','#33a02c','#fb9a99',
+               '#e31a1c','#fdbf6f','#ff7f00','#cab2d6','#6a3d9a')
+  ) +
+
+  labs(x = NULL, y = "Change in St relative to early period (%)") +
+  coord_cartesian(ylim = c(-50, 40)) +
+  plotTheme1 +
+  theme(
+    strip.background = element_blank(),
+    axis.text.x = element_text(angle = 25, hjust = 1),
+    panel.spacing.x = unit(0.8, "lines"),
+    legend.position = "right"
+  )
+plot.relative.St
+
+# Save plot
+ggsave(plot.relative.St, file="FigSx_Relative_St_decline_fixed_preseason.pdf", path=output.dir,
+       width=9, height=6)
+```
+
+</details>
+
+<details>
+
+<summary>Relative St and variance ratio plots (Fig. Sx)</summary>
+
+```{r, warning=F, message=F}
+#------------------------------------------------------------
+# Relative St and variance ratio plots
+#------------------------------------------------------------
+
+
+# equations
+equations = c("St_PS60_abs",
+              "St_PS60_log",
+              "St_PS60_z",
+              
+              "St_PSfix_abs",
+              "St_PSfix_log",
+              "St_PSfix_z")
+
+# Define desired phenology order
+phenology_levels <- c("leaf_out",
+                      "leaf_out_GDD", 
+                      "leaf_out_GDD.chill.lo", 
+                      "leaf_out_GDD.chill.hi", 
+                      "leaf_out_GDD.chill.DL")
+
+
+#------------------------------------------------------------
+# Loop over equations
+#------------------------------------------------------------
+
+for (equation.name in equations) {
+  
+  # Create data
+  #------------
+  # Model summay data
+  St.summary.all.df = model.summary.all.df %>% 
+    filter(
+      equation == equation.name,
+      metric %in% c("estimate_rel","cor_xy",
+                    "sd_x_rel","var_ratio_rel")) %>% 
+    mutate(phenology = factor(phenology, levels = phenology_levels))
+  
+  # Linear trend (slope ± 2*SE)
+  ann_slope = linear.trends.df %>% 
+    filter(
+      equation == equation.name,
+      metric %in% c("estimate_rel","cor_xy",
+                    "sd_x_rel","var_ratio_rel")) %>% 
+    mutate(x = -Inf, y = -Inf,
+           phenology = factor(phenology, levels = phenology_levels))
+  
+  
+  # Create plot
+  #------------
+  plot = model.summary.df %>% 
+    filter(
+      equation == equation.name,
+      metric %in% c("estimate_rel","cor_xy",
+                    "sd_x_rel","var_ratio_rel")) %>% 
+  
+    dplyr::mutate(phenology = factor(phenology, levels = phenology_levels)) %>% # sort factors
+  
+    ggplot() + 
+    
+    geom_hline(yintercept = 0) +
+  
+    # Confidence ribbon for overall trend
+    geom_ribbon(data=St.summary.all.df,
+                aes(x = MWyear, y = mean_all, ymin = lo, ymax = hi),
+                fill = "darkgrey", color=NA, alpha = 0.9) + 
+  
+    # Individual species lines (filtered from pipe input)
+    geom_line(aes(x = MWyear, y = mean, group=species, color=species), linewidth = 0.4) +
+  
+    # Linear trend over the aggregated series (dashed)
+    geom_smooth(data = St.summary.all.df,
+                aes(x = MWyear, y = mean_all),
+                method='lm', formula = y~x, se = FALSE, 
+                linewidth=1, linetype="dashed", color="black") +
+  
+    # Smoothed line: overall trend (black line)
+    geom_line(data=St.summary.all.df, aes(x = MWyear, y = mean_all),
+              color="black", size=1) +
+  
+    # Manual species color palette
+    scale_color_manual("Species", 
+                       values = c('#a6cee3','#1f78b4','#b2df8a','#33a02c','#fb9a99',
+                                  '#e31a1c','#fdbf6f','#ff7f00','#cab2d6','#6a3d9a'))+
+  
+    # Axis limits: restrict x-range to window years; y-range customized
+    coord_cartesian(xlim=c(1967.9,2007.1))+
+  
+    xlab("") + ylab(expression("Relative change"))+
+  
+    # X-axis breaks for moving-window labels (left blank intentionally)
+    scale_x_continuous(breaks = seq(1966,2008,by=5),
+                       labels = c('1966-1980','1971-1985','1976-1990',
+                                  '1981-1995','1986-2000','1991-2005',
+                                  '1996-2010','2001-2015','2006-2020')) +
+  
+    # Slope annotation
+    geom_text(
+    data = ann_slope,
+    aes(x = x, y = y, label = label),
+    inherit.aes = FALSE,
+    hjust = -0.05, vjust = -1, size = 3.5) +
+  
+    facet_grid(metric~phenology, scales = "free_y") +
+  
+    # Plot theme and legend
+    plotTheme1
+
+  print(plot)
+  
+  # Fig. Sx-y: Relative St + Variance ratio plots
+  ggsave(plot, 
+       file=paste0("FigSX_VarianceRatios_", equation.name, ".pdf"), 
+       path=output.dir,
+       width=14, height=8)
+  
+}
+```
+
+</details>
+
+<br>
+
+# 4. Reproducibility
+
+<details>
+
+<summary>Show</summary>
+
+```{r}
+# Datetime
+Sys.time()
+
+# Session info
+sessionInfo()
+```
+
+</details>

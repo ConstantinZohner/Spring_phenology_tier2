@@ -1,0 +1,141 @@
+---
+title: Spring phenology tier2 project
+author: Constantin Zohner
+date: "last updated 13 February 2025"
+
+subtitle: R code generating the photoperiod data
+output:
+  html_document:
+    highlight: haddock
+    toc: false
+    use_bookdown: true
+    df_print: paged
+---
+
+<style>
+body
+  { counter-reset: source-line 0; }
+pre.numberSource code
+  { counter-reset: none; }
+</style>
+
+<br>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  class.source = "numberLines lineAnchors"
+  )
+```
+
+<br><br>
+
+```{r, message=FALSE, warning=FALSE, attr.source='.numberLines'}
+#####################
+# Required packages #
+#####################
+
+
+
+require(data.table)
+require(geosphere)
+require(zoo)
+require(lubridate)
+require(tidyverse)
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+######################################
+## Set directories and get PEP data ##
+######################################
+
+
+
+# set the working directory
+setwd("/Users/consti/Desktop/PhD/Publication_material/40_Spring_phenology_tier2/PEP725_Analysis")
+
+## Paths
+
+#Phenology
+PEPcsv_path = "PEP_data"
+
+#Output
+Photo_path  = "Analysis_input/Photoperiod"
+
+
+## load phenology data
+PEP.df <- fread(paste(PEPcsv_path, "PEP725_coordinates.csv", sep="/"))
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+#################
+## Photoperiod ##
+#################
+
+
+
+# Get all time-points
+site <- unique(PEP.df$s_id)
+
+# Initialize data frame to store results
+photo.df <- data.frame()
+i=1
+
+for(id in site) {
+
+  # Subset table according to latitude
+  photo.sub <- PEP.df %>% 
+    filter(s_id==id) %>% 
+    dplyr::select(s_id,lat)
+  
+  # Calculate daily photoperiod for the whole year
+  photo = as.data.frame(t(geosphere::daylength(photo.sub$lat,1:366))) %>% 
+    rename_all(readr::parse_number)
+  
+  # Add daily photoperiods to the subset table
+  photo.sub = cbind(photo.sub, photo)
+  
+  # Rbind tables
+  photo.df  = rbind(photo.df,photo.sub)
+  #print(paste0(round(i/length(site)*100, 1)," % of photoperiods calculated!"))
+  i=i+1
+}
+rm(photo.sub)
+
+# Export dataset
+write.table(photo.df, paste0(Photo_path,"/Photoperiod.csv"), sep=",", row.names=FALSE)
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+#####################
+## Reproducibility ##	
+#####################
+
+
+
+## date time
+Sys.time()
+
+## session info
+sessionInfo()
+
+
+
+##############################################################################################################################################
+#############################################################THE END##########################################################################
+##############################################################################################################################################
+```

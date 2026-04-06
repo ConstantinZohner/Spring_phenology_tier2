@@ -1,0 +1,433 @@
+---
+title: Spring phenology tier2 project
+author: Constantin Zohner
+date: "last updated 10 May 2025"
+
+subtitle: Find optimal preseason periods for PEP725 data
+output:
+  html_document:
+    highlight: haddock
+    toc: false
+    use_bookdown: true
+    df_print: paged
+    fig_caption: yes
+---
+
+<style>
+body
+  { counter-reset: source-line 0; }
+pre.numberSource code
+  { counter-reset: none; }
+</style>
+
+<br>
+
+### Driver names
+- RH: Relative air humidity
+- SWR: Short-wave radiation
+- Tmin: Daily minimum air temperature
+- Tmean: Daily mean air temperature
+- Tmax: Daily maximum air temperature
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  class.source = "numberLines lineAnchors"
+  )
+```
+
+<br><br>
+
+```{r, message=F, warning=F}
+#####################
+# Required packages #
+#####################
+
+
+
+require(tidyverse)
+require(data.table)
+require(broom)
+require(patchwork)
+require(MASS)
+require(wesanderson)
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+##########################################
+## Set directories and get own PEP data ##
+##########################################
+
+
+# paths
+PEP_path    = "/Users/consti/Desktop/PhD/Publication_material/40_Spring_phenology_tier2/PEP725_Analysis/Analysis_input/PEP_drivers_final_spring/Merged_file"
+output_path = "/Users/consti/Desktop/PhD/Publication_material/40_Spring_phenology_tier2/PEP725_Analysis/Analysis_output/Preseason_sensitivity"
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+#################
+## Import data ##
+#################
+
+
+
+PEP.df <- fread(paste(PEP_path, "pep_drivers_spring_data_clean.csv", sep="/"))%>% 
+  dplyr::select(-V1)
+
+
+#define plot themes
+plotTheme1 = theme(legend.position   = "none",
+                   legend.background = element_rect(fill=NA, linewidth=0.5, linetype="solid"),
+                   legend.text       = element_text(color="black"),
+                   panel.grid.major  = element_blank(),
+                   panel.grid.minor  = element_blank(),
+                   panel.background  = element_blank(),
+                   panel.border      = element_rect(colour = "black", fill=NA),
+                   axis.line         = element_line(color = "black"),
+                   axis.text         = element_text(colour = "black"),
+                   strip.background  = element_rect(fill=NA),
+                   strip.text        = element_text(colour = 'black', face="italic"),
+                   plot.title        = element_text(face="bold"))
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+########################
+## Get best preseason ##
+########################
+
+
+
+# Reshape table to long format
+##############################
+
+preseason.df = PEP.df %>%
+  #select columns
+  dplyr::select(timeseries,year,species,s_id,leaf_out,
+                starts_with(c("Tmean.PS","Tmin.PS","Tmax.PS","SWrad.PS","RH.PS"))) %>%
+  #long format
+  pivot_longer(.,cols=starts_with(c("Tm","SWrad","RH")), names_to = "preseason", values_to = "value") %>%
+  #create preseason length and variable class columns
+  mutate(preseason_length = readr::parse_number(gsub("[.]", "", preseason)), #keep only numbers in string
+         var_class = gsub("\\..*","", preseason)) %>%
+  dplyr::select(-preseason)
+
+
+# Correlation coefficients
+##########################
+
+resultsLM = preseason.df %>%  
+  group_by(timeseries, species, s_id, var_class, preseason_length) %>% 
+  summarise(coeff = cor(leaf_out, value)) %>% 
+  ungroup()
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+##########################################
+## Plot preseason-leaf-out correlations ##
+##########################################
+
+
+
+# Mean across all timeseries and species
+########################################
+
+ModelLabs <- c("RH","SWR",expression("T"["min"]), expression("T"["mean"]),expression("T"["max"]))
+plot.estimate.all = resultsLM %>%
+  mutate(var_class = factor(var_class, levels = c("RH","SWrad","Tmin","Tmean","Tmax"))) %>% 
+  ggplot()+
+  aes(x=preseason_length, y=coeff, 
+      colour=var_class, group=var_class) +
+  geom_hline(yintercept = 0)+
+  stat_summary(fun = mean, geom="line", linewidth = .7) +
+  scale_color_manual(values = wes_palette("Zissou1", n = 5), labels=ModelLabs) +
+  stat_summary(fun.data = "mean_cl_normal", geom="errorbar", linewidth = 0.5, width=0) +
+  stat_summary(fun.data = "mean_cl_normal", geom="point", size = 1) +
+  xlab("Preseason length (days)") +
+  ylab("Correlation coefficient") +
+  coord_cartesian(ylim = c(-0.65, 0.65), xlim=c(14,116))+
+  plotTheme1+
+  theme(legend.position   = c(.84,.84),
+        legend.title = element_blank(),
+        legend.key = element_blank(),
+        legend.text.align = 0)
+
+
+# Species-specific
+##################
+
+plot.estimate = resultsLM %>%
+  mutate(var_class = factor(var_class, levels = c("RH","SWrad","Tmin","Tmean","Tmax"))) %>% 
+  ggplot()+
+  aes(x=preseason_length, y=coeff, 
+      colour=var_class, group=var_class) +
+  geom_hline(yintercept = 0)+
+  stat_summary(fun = mean, geom="line", size = .7) +
+  scale_color_manual(values = (wes_palette("Zissou1", n = 5))) +
+  stat_summary(fun.data = "mean_cl_normal", geom="errorbar", linewidth = 0.5, width=0) +
+  stat_summary(fun.data = "mean_cl_normal", geom="point", size = 1) +
+  xlab("Preseason length (days)") +
+  ylab("Correlation coefficient") +
+  coord_cartesian(ylim = c(-0.7, 0.7),xlim=c(14,116))+
+  facet_wrap(~species, ncol=1) +
+  plotTheme1 +
+  theme(strip.text.x = element_blank())
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+#####################################################
+## Plot best preseason length for each temperature ##
+#####################################################
+
+
+
+#keep only models with highest absolute correlation coefficients
+resultsLM2 = resultsLM %>%   
+  group_by(timeseries,var_class) %>% 
+  top_n(1, abs(coeff)) %>%
+  ungroup()
+
+#Mean preseason length
+resultsLM2 %>% 
+  group_by(species, var_class) %>% 
+  summarize(meanPre = mean(preseason_length)) %>% 
+  ungroup()
+
+
+# Mean across all timeseries and species
+########################################
+
+plot.length.all = resultsLM2 %>%
+  mutate(var_class = factor(var_class, levels = c("RH","SWrad","Tmin","Tmean","Tmax"))) %>% 
+  dplyr::select(species,var_class,preseason_length)%>%
+  ggplot()+
+  aes(x=var_class, y=preseason_length, colour=var_class, fill=var_class, alpha=0.5) +
+  geom_boxplot(outlier.colour = NA)+
+  scale_color_manual(values = wes_palette("Zissou1", n = 5)) +
+  scale_fill_manual(values = wes_palette("Zissou1", n = 5)) +
+  scale_x_discrete(labels= ModelLabs)+
+  coord_cartesian(ylim = c(10, 117))+
+  xlab("") +
+  ylab("Best preseason length (days)") +
+  plotTheme1+
+  theme(strip.text.x = element_blank(),
+        axis.text.x  = element_text(angle = 45, hjust=1))
+
+
+# Species-specific
+##################
+
+plot.length = resultsLM2 %>%
+  mutate(var_class = factor(var_class, levels = c("RH","SWrad","Tmin","Tmean","Tmax"))) %>% 
+  dplyr::select(species,var_class,preseason_length)%>%
+  ggplot()+
+  aes(x=var_class, y=preseason_length, colour=var_class, fill=var_class, alpha=0.5) +
+  scale_color_manual(values = (wes_palette("Zissou1", n = 5))) +
+  scale_fill_manual(values = wes_palette("Zissou1", n = 5)) +
+  scale_x_discrete(labels= ModelLabs)+
+  geom_boxplot(outlier.colour = NA)+
+  coord_cartesian(ylim = c(10, 117))+
+  xlab("") +
+  ylab("Best preseason length (days)") +
+  facet_wrap(~species, ncol=1) +
+  plotTheme1+
+  theme(strip.text.x = element_blank(),
+        axis.text.x  = element_text(angle = 45, hjust=1))
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+#####################################
+#Add best preseason temps to PEP data
+#####################################
+
+
+
+#add variables
+PEP.df = PEP.df %>%
+  inner_join(., preseason.df %>%
+               #filter by model data
+               semi_join(resultsLM2, by=c('timeseries','var_class','preseason_length')) %>%
+               dplyr::select(c(timeseries,year,var_class,value))%>%
+               pivot_wider(.,names_from = var_class, values_from = value),
+             by = c("year", "timeseries"))
+
+#add preseason lengths
+PEP.df = PEP.df %>%
+  inner_join(., preseason.df %>%
+               #filter by model data
+               semi_join(resultsLM2, by=c('timeseries','var_class','preseason_length')) %>%
+               dplyr::select(c(timeseries,year,var_class, preseason_length))%>%
+               mutate(var_class = paste(var_class, "length", sep="_")) %>% 
+               pivot_wider(.,names_from = var_class, values_from = preseason_length),
+             by = c("year", "timeseries"))
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+##################################
+#Run linear ridge regression model
+##################################
+
+
+
+resultsLM3 = PEP.df %>% 
+  group_by(timeseries,species) %>% 
+  do({model = lm.ridge(scale(leaf_out) ~ scale(Tmax)+scale(SWrad)+scale(RH), data=.)  # linear model
+  data.frame(tidy(model),         # coefficient info
+             glance(model))}) %>% # model info
+  filter(!term %in% c("(Intercept)")) %>%
+  ungroup()%>%
+  #rename variable class
+  mutate(term=recode(term,
+                     `scale(Tmax)`="Tmax",
+                     `scale(RH)`="RH",
+                     `scale(SWrad)`="SWrad"))
+
+
+# Plot preseason-leaf-out correlations
+######################################
+
+ModelLabs2 <- c("RH","SWR",expression("T"["max"]))
+
+
+# Mean across all timeseries and species
+########################################
+
+plot.ridge.all = resultsLM3 %>%
+  ggplot()+
+  aes(x=term, y=estimate, colour=term, fill=term, alpha=0.5) +
+  scale_color_manual(values = c("#3B9AB2","#78B7C5","#F21A00")) +
+  scale_fill_manual(values = c("#3B9AB2","#78B7C5","#F21A00")) +
+  scale_x_discrete(labels= ModelLabs2)+
+  geom_boxplot(outlier.shape = NA)+
+  geom_hline(yintercept = 0)+
+  xlab("") +
+  ylab("Standardized coefficient (ridge regression)") +
+  coord_cartesian(ylim = c(-0.9, 0.9))+
+  plotTheme1+
+  theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+
+# Species-specific
+##################
+
+plot.ridge = resultsLM3 %>%
+  ggplot()+
+  aes(x=term, y=estimate, colour=term, fill=term, alpha=0.5) +
+  scale_color_manual(values = c("#3B9AB2","#78B7C5","#F21A00")) +
+  scale_fill_manual(values = c("#3B9AB2","#78B7C5","#F21A00")) +
+  scale_x_discrete(labels= ModelLabs2)+
+  geom_boxplot(outlier.shape = NA)+
+  geom_hline(yintercept = 0)+
+  xlab("") +
+  ylab("Standardized coefficient (ridge regression)") +
+  coord_cartesian(ylim = c(-0.9, 0.9))+
+  facet_wrap(~species, ncol=1,strip.position = "right") +
+  plotTheme1+
+  theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+##########################
+# Arrange and safe plots #
+##########################
+
+
+
+#define plot layout
+layout <- "BCD"
+
+#Merge plots
+PreseasonPlotAll = plot.estimate.all + plot.length.all + plot.ridge.all +
+  plot_layout(design = layout) + plot_annotation(tag_levels = 'a')&
+  theme(plot.tag = element_text(face = 'bold'))
+PreseasonPlotAll
+
+PreseasonPlot = plot.estimate + plot.length + plot.ridge +
+  plot_layout(design = layout) + plot_annotation(tag_levels = 'a')&
+  theme(plot.tag = element_text(face = 'bold'))
+PreseasonPlot
+
+#Safe plot
+pdf(paste(output_path,"Preseason_sensitivity_all.pdf",sep="/"), width=10, height=4.2, useDingbats=FALSE)
+PreseasonPlotAll
+dev.off()
+
+pdf(paste(output_path,"Preseason_sensitivity_species.pdf",sep="/"), width=7.2, height=14, useDingbats=FALSE)
+PreseasonPlot
+dev.off()
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+#Safe table
+write.csv(PEP.df, paste(PEP_path, "pep_drivers_spring_data_clean_preseason.csv", sep="/"))
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+#####################
+## Reproducibility ##	
+#####################
+
+
+
+## datetime
+Sys.time()
+
+
+## session info
+sessionInfo()
+
+
+
+##############################################################################################################################################
+#############################################################THE END##########################################################################
+##############################################################################################################################################
+```

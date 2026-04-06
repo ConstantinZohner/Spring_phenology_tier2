@@ -1,0 +1,453 @@
+#####################
+# Required packages #
+#####################
+
+
+
+require(data.table)
+require(tidyverse)
+require(pbmcapply)
+require(chillR)
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+################
+# Define Paths #
+################
+
+
+# 1. Input
+##########
+
+
+#Climate
+EOBS.dir  = "Full_analysis/Input/EOBS_data"
+
+# PEP data
+PEP.dir   = "Full_analysis/Output/Merged_file"
+
+# Modeled data
+model.dir = "Full_analysis/Output_models"
+
+
+# 2. Output
+###########
+
+Output.dir1 = "Moving_window_analysis/Output"
+Output.dir2 = "Moving_window_analysis/Output/Missing_observations"
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+#################
+## Import data ##
+#################
+
+
+
+# Phenology data
+################
+
+PEP.df   = fread(paste(PEP.dir, "pep_drivers_spring_data.csv", sep="/")) %>% 
+  dplyr::select(c(s_id, species, timeseries, year, alt_dem, leaf_out))
+
+
+# Modeled data
+##############
+
+model.df = fread(paste(model.dir, "pep_model_predictions.csv", sep="/")) %>% 
+  dplyr::select(-c(V1, leaf_out))
+
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+################
+## Merge data ##
+################
+
+
+
+# Merge and filter data
+PEP.df = inner_join(PEP.df, model.df, by = c("s_id", "species", "timeseries", "year")) %>% 
+  group_by(timeseries)%>%
+  filter(!alt_dem>600, year>=1966) %>%
+  filter(n() >= 20) %>% 
+  ungroup()
+
+# Long format 
+PEP.df = pivot_longer(PEP.df, 
+                      cols = c(leaf_out, leaf_out_GDD, leaf_out_GDD.chill.lo, leaf_out_GDD.chill.hi, leaf_out_GDD.chill.DL), 
+                      names_to = "phenology", values_to = "leaf_out")
+
+# Year vector
+year.vector  = c(min(PEP.df$year):(max(PEP.df$year)-14))
+
+# Counter
+i=1
+
+# Create List object
+List.year = replicate(length(year.vector), data.frame())
+names(List.year) = year.vector
+
+# Loop to bind individual moving-window data frames
+for(MW.year in year.vector) {
+  
+  PEP.df.sub = PEP.df %>% 
+    # filter years within 15-year moving window
+    filter(year >= MW.year,
+           year < MW.year + 15) %>% 
+    # Group by timeseries and phenology
+    group_by(timeseries, phenology) %>%
+    # Delete timeseries <12 years
+    filter(n() >= 12) %>%
+    # Add mean leaf-out date
+    mutate(leaf_out_mean = round(mean(leaf_out)),
+           leaf_out_sd   = sd(leaf_out)) %>% 
+    ungroup() %>% 
+    mutate(MWyear = MW.year,
+           ts_yr  = paste(timeseries,phenology,year,MW.year, sep="_")) 
+  
+  # store dataframe in year list
+  List.year[[i]] = PEP.df.sub
+  
+  # Increase counter and print
+  i=i+1
+  #print(MW.year)
+}  
+
+# Merge list to data frame
+PEP.MW.df = do.call(rbind.data.frame, List.year)
+
+
+#-------------------------------------------------------------------------
+
+
+## Import daily climatic datasets from E-OBS
+############################################
+
+#define climate variables
+list.files(EOBS.dir)
+vn <- c("tg_ens_mean_0.1deg_reg_v30.0e.csv", # daily mean temperature 
+        "tn_ens_mean_0.1deg_reg_v30.0e.csv", # daily minimum temperature
+        "tx_ens_mean_0.1deg_reg_v30.0e.csv", # daily maximum temperature
+        "hu_ens_mean_0.1deg_reg_v30.0e.csv", # daily mean relative humidity 
+        "qq_ens_mean_0.1deg_reg_v29.0e.csv") # global radiation
+
+#create empty list
+DataList <- replicate(length(vn),data.frame())
+#loop through climate variables
+for(i in 1:length(vn)) {
+  #read data
+  data = fread(paste0(EOBS.dir, "/", vn[i]))
+  #add table to list
+  DataList[[i]] = data }
+#add names to list
+names(DataList)=vn
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+######################
+## Helper functions ##
+######################
+
+
+
+#################################
+# Replace NA with neighbor mean #
+#################################
+
+
+replace_na_with_neighbor_mean <- function(x) {
+  if (!is.numeric(x)) return(x)  # Ensure only numeric columns are processed
+  
+  na_indices <- which(is.na(x))  # Identify NA indices
+  known_indices <- which(!is.na(x))  # Identify non-NA values
+  
+  if (length(known_indices) == 0) {
+    return(x)  # If all values are NA, return as is
+  }
+  
+  for (i in na_indices) {
+    # Find nearest non-NA before and after
+    before_idx <- ifelse(any(known_indices < i), max(known_indices[known_indices < i]), NA)
+    after_idx <- ifelse(any(known_indices > i), min(known_indices[known_indices > i]), NA)
+    
+    if (!is.na(before_idx) & !is.na(after_idx)) {
+      # Compute mean of the surrounding values
+      x[i] <- mean(c(x[before_idx], x[after_idx]), na.rm = TRUE)
+    } else if (!is.na(before_idx)) {
+      x[i] <- x[before_idx]  # If NA is at the end, take the previous value
+    } else if (!is.na(after_idx)) {
+      x[i] <- x[after_idx]  # If NA is at the beginning, take the next value
+    }
+  }
+  
+  return(x)
+}
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+##############################
+## Merge datasets into list ##
+##############################
+
+
+
+# Identifier 1 (all site x year combinations)
+PEP.MW.df$site_year = paste0(PEP.MW.df$s_id,"_",PEP.MW.df$year)
+
+# Identifier 2 (all timeseries x year combinations)
+timeseries_yearFull = unique(PEP.MW.df$ts_yr)
+timeseries_year = timeseries_yearFull[3000001:6000000]
+
+# add PEP data to list
+DataList[[6]] = PEP.MW.df
+
+rm(data, PEP.MW.df, PEP.df)
+names(DataList)=c(vn,"PEP")
+names(DataList)
+
+
+
+
+############################################################
+## Loop through each observation using parallel computing ##
+############################################################
+
+
+
+parallelCalc <- function(timeseries_years){ 
+  
+  # Subset input data by time-point
+  #################################
+  
+  #phenology data
+  pheno.sub  <- DataList[[6]][which(DataList[[6]]$ts_yr==timeseries_years),]
+  
+  # Define the length of the period of interest in calendar units
+  year1     <- as.character(pheno.sub$year-1)
+  year2     <- as.character(pheno.sub$year)
+  start_doy <- paste(year1,"-01-01", sep="") 
+  end_doy   <- paste(year2,"-06-30", sep="")
+  days      <- seq(as.Date(start_doy), as.Date(end_doy), by="days")
+  
+  #get number of days in year 1 and year 2
+  days_year1 <- length(seq(as.Date(start_doy), as.Date(paste(year1,"-12-31", sep="")), by="days"))
+  days_year2 <- length(seq(as.Date(paste0(year2,"-01-01")), as.Date(end_doy), by="days"))
+  
+  
+  # ------------------------------------------------------------------------
+  # Short Name        ; Long Name                               ; Unit [d-1]
+  # ------------------------------------------------------------------------
+  # SWRAD             ; Surface shortwave downwelling radiation ; W m-2
+  # RH                ; Relative humidity                       ; %
+  # TMIN              ; Minimum Air Temperature                 ; degC
+  # TMEAN             ; Mean Air Temperature                    ; degC
+  # TMAX              ; Maximum Air Temperature                 ; degC
+  # ------------------------------------------------------------------------
+  
+  
+  #Tmean
+  T_mean.sub2 <- DataList[[1]][which(DataList[[1]]$site_year==pheno.sub$site_year),]%>%
+    dplyr::select(as.character(1:days_year2))
+  
+  #Skip timeseries for which there is no data
+  if (
+    # 1) no climate data for current year and/or
+    nrow(T_mean.sub2)==0 |
+    # 2) no climate data for previous year
+    nrow(DataList[[1]][which(DataList[[1]]$s_id==pheno.sub$s_id & DataList[[1]]$year==year1),])==0
+  ) {
+    write.table(pheno.sub, file=paste0(Output.dir2, '/', timeseries_years, '.csv'), 
+                sep=',', row.names = F, col.names = T)
+  } else {
+    
+    T_mean.sub1 <- DataList[[1]][which(DataList[[1]]$s_id==pheno.sub$s_id & DataList[[1]]$year==year1),]%>% 
+      dplyr::select(as.character(1:days_year1))
+    T_mean.sub  <- cbind(T_mean.sub1, T_mean.sub2)
+    
+    #Tmin
+    T_min.sub1 <- DataList[[2]][which(DataList[[2]]$s_id==pheno.sub$s_id & DataList[[2]]$year==year1),]%>% 
+      dplyr::select(as.character(1:days_year1))
+    T_min.sub2 <- DataList[[2]][which(DataList[[2]]$site_year==pheno.sub$site_year),]%>%
+      dplyr::select(as.character(1:days_year2))
+    T_min.sub  <- cbind(T_min.sub1, T_min.sub2)
+    
+    #Tmax
+    T_max.sub1 <- DataList[[3]][which(DataList[[3]]$s_id==pheno.sub$s_id & DataList[[3]]$year==year1),]%>% 
+      dplyr::select(as.character(1:days_year1))
+    T_max.sub2 <- DataList[[3]][which(DataList[[3]]$site_year==pheno.sub$site_year),]%>%
+      dplyr::select(as.character(1:days_year2))
+    T_max.sub  <- cbind(T_max.sub1, T_max.sub2)
+    
+    #RH
+    rh.sub1 <- DataList[[5]][which(DataList[[5]]$s_id==pheno.sub$s_id & DataList[[5]]$year==year1),]%>% 
+      dplyr::select(as.character(1:days_year1))
+    rh.sub2 <- DataList[[5]][which(DataList[[5]]$site_year==pheno.sub$site_year),]%>%
+      dplyr::select(as.character(1:days_year2))
+    rh.sub  <- cbind(rh.sub1, rh.sub2)
+    
+    #SWrad
+    swrad.sub1 <- DataList[[5]][which(DataList[[5]]$s_id==pheno.sub$s_id & DataList[[5]]$year==year1),]%>% 
+      dplyr::select(as.character(1:days_year1))
+    swrad.sub2 <- DataList[[5]][which(DataList[[5]]$site_year==pheno.sub$site_year),]%>%
+      dplyr::select(as.character(1:days_year2))
+    swrad.sub  <- cbind(swrad.sub1, swrad.sub2)
+    
+    
+    ##############################################################################################################################################
+    
+    
+    ###############################
+    # Create table of daily climate
+    ###############################
+    
+    
+    # Generate sub-dataframe to store results
+    factors.sub <- pheno.sub %>% 
+      dplyr::select(s_id,species,timeseries,phenology,alt_dem,
+                    MWyear,year,
+                    leaf_out,leaf_out_mean,leaf_out_sd)
+    factors.sub = as.data.frame(factors.sub) 
+    
+    #create table
+    daily_vals <- data.frame(Year     = lubridate::year(as.Date(days,origin=days[1])),
+                             Month    = lubridate::month(as.Date(days,origin=days[1])),
+                             Day      = lubridate::day(as.Date(days,origin=days[1])),
+                             DOY      = as.numeric(names(T_mean.sub)),
+                             Tmin     = as.numeric(T_min.sub), 
+                             Tmean    = as.numeric(T_mean.sub), 
+                             Tmax     = as.numeric(T_max.sub), 
+                             SWrad    = as.numeric(swrad.sub),
+                             RH       = as.numeric(rh.sub)) %>% 
+      #replace NAs with neighbor mean
+      mutate(across(c(Tmin, Tmean, Tmax, SWrad, RH), replace_na_with_neighbor_mean))
+    
+    
+    ##############################################################################################################################################
+    
+    
+    #####################
+    # Get important dates
+    #####################
+    
+    
+    #row of mean leaf-out date
+    DOY_out_mean = which(daily_vals$DOY == pheno.sub$leaf_out_mean & daily_vals$Year==year2)   
+    
+    
+    ##############################################################################################################################################
+    
+    
+    ############################
+    # Get preseason temperatures
+    ############################
+    
+    
+    ## Calculate the average, SD and slopes of preseason temperatures 
+    # 10 to 120 days prior to mean leaf-out date
+    
+    #get preseason length vector (10 to 120 days with 10-day steps)
+    preseason.lengths = seq(10, 120, 10)
+    
+    #loop through preseasons
+    for(preseason.length in preseason.lengths) {
+      
+      #name columns
+      #means
+      preseason.Tmean    <- paste0("Tmean.PS",  preseason.length)
+      preseason.Tmax     <- paste0("Tmax.PS",   preseason.length)
+      preseason.Tmin     <- paste0("Tmin.PS",   preseason.length)
+      preseason.SWrad    <- paste0("SWrad.PS",  preseason.length)
+      preseason.RH       <- paste0("RH.PS",     preseason.length)
+      #sd
+      preseason.sd.Tmean <- paste0("Tmean.IntraSD.PS", preseason.length)
+      preseason.sd.Tmax  <- paste0("Tmax.IntraSD.PS",  preseason.length)
+      preseason.sd.Tmin  <- paste0("Tmin.IntraSD.PS",  preseason.length)
+      #slopes
+      preseason.slope.Tmean <- paste0("Tmean.slope.PS", preseason.length)
+      preseason.slope.Tmax  <- paste0("Tmax.slope.PS",  preseason.length)
+      preseason.slope.Tmin  <- paste0("Tmin.slope.PS",  preseason.length)
+      
+      #add columns to table
+      factors.sub = factors.sub %>%
+        mutate(
+          #means
+          !!preseason.Tmean    := mean(daily_vals$Tmean[(DOY_out_mean-preseason.length):DOY_out_mean]),
+          !!preseason.Tmax     := mean(daily_vals$Tmax[(DOY_out_mean-preseason.length):DOY_out_mean]),
+          !!preseason.Tmin     := mean(daily_vals$Tmin[(DOY_out_mean-preseason.length):DOY_out_mean]),
+          !!preseason.SWrad    := mean(daily_vals$SWrad[(DOY_out_mean-preseason.length):DOY_out_mean]),
+          !!preseason.RH       := mean(daily_vals$RH[(DOY_out_mean-preseason.length):DOY_out_mean]),
+          #sd
+          !!preseason.sd.Tmean := sd(daily_vals$Tmean[(DOY_out_mean-preseason.length):DOY_out_mean]),
+          !!preseason.sd.Tmax  := sd(daily_vals$Tmax[(DOY_out_mean-preseason.length):DOY_out_mean]),
+          !!preseason.sd.Tmin  := sd(daily_vals$Tmin[(DOY_out_mean-preseason.length):DOY_out_mean]),
+          #slope
+          !!preseason.slope.Tmean := coef(lm(daily_vals$Tmean[(DOY_out_mean-preseason.length):DOY_out_mean] ~ daily_vals$DOY[(DOY_out_mean-preseason.length):DOY_out_mean]))[2],
+          !!preseason.slope.Tmax  := coef(lm(daily_vals$Tmax[(DOY_out_mean-preseason.length):DOY_out_mean] ~ daily_vals$DOY[(DOY_out_mean-preseason.length):DOY_out_mean]))[2],
+          !!preseason.slope.Tmin  := coef(lm(daily_vals$Tmin[(DOY_out_mean-preseason.length):DOY_out_mean] ~ daily_vals$DOY[(DOY_out_mean-preseason.length):DOY_out_mean]))[2])
+      
+    }
+    
+    
+    ##############################################################################################################################################
+    
+    
+    # Safe the table  
+    return(factors.sub)
+  }
+}
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+#initialize the loop
+outputlist         <- mclapply(timeseries_year, parallelCalc, mc.cores=48, mc.preschedule=T)
+climate.factors.df <- rbindlist(outputlist)
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+###################
+## Safe the data ##
+###################
+
+
+
+#Safe table
+write.csv(climate.factors.df, paste(Output.dir1, "pep_preseasonsMW15_spring_data_subset_002.csv", sep="/"))
+
+
+

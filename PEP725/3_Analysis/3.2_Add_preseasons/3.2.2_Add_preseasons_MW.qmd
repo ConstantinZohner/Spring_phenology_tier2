@@ -1,0 +1,464 @@
+---
+title: "Spring phenology tier2 project"
+author: "Constantin Zohner"
+date: "Last run: `r format(Sys.Date(), '%d %B %Y')`"
+subtitle: "Find optimal preseason periods for moving windows"
+
+format:
+  html:
+    toc: false
+    theme: default
+    highlight-style: haddock
+    df-print: paged
+    embed-resources: true
+
+execute:
+  warning: false
+  message: false
+  echo: true
+  output: true
+
+always_allow_html: true
+editor: visual
+editor_options:
+  chunk_output_type: inline
+---
+
+<br>
+
+### **Driver names**
+
+-   RH: Relative air humidity
+-   SWrad: Short-wave radiation
+-   Tmin: Daily minimum air temperature
+-   Tmean: Daily mean air temperature
+-   Tmax: Daily maximum air temperature
+
+<br>
+
+# 1. Setup
+
+<details>
+
+<summary>Packages</summary>
+
+```{r}
+require(tidyverse)
+require(data.table)
+require(patchwork)
+require(wesanderson)
+```
+
+</details>
+
+<details>
+
+<summary>Plot theme</summary>
+
+```{r}
+plotTheme1 = theme(legend.position   = "none",
+                   legend.background = element_rect(fill=NA, linewidth=0.5, linetype="solid"),
+                   legend.text       = element_text(color="black"),
+                   panel.grid.major  = element_blank(),
+                   panel.grid.minor  = element_blank(),
+                   panel.background  = element_blank(),
+                   panel.border      = element_rect(colour = "black", fill=NA),
+                   axis.line         = element_line(color = "black"),
+                   axis.text         = element_text(colour = "black"),
+                   strip.background  = element_rect(fill=NA),
+                   strip.text        = element_text(colour = 'black'),
+                   plot.title        = element_text(face="bold"))
+```
+
+</details>
+
+<details>
+
+<summary>Directories</summary>
+
+```{r}
+# Define the base directory
+base.dir <- "/Users/goalie/Desktop/PhD/Publication_material/40_Spring_phenology_tier2/PEP725_Analysis"
+
+# Build specific directories from the base
+PEP.dir    <- file.path(base.dir, "Analysis_input/PEP_drivers_final_spring_MW/MW15/Merged_file")
+chunkPEP.dir <- file.path(base.dir, "Analysis_input/PEP_drivers_final_spring_MW/MW15/data_chunks/0_PEP_tables")
+chunk1.dir <- file.path(base.dir, "Analysis_input/PEP_drivers_final_spring_MW/MW15/data_chunks/1_Long_tables")
+chunk2.dir <- file.path(base.dir, "Analysis_input/PEP_drivers_final_spring_MW/MW15/data_chunks/2_Result_tables")
+chunk3.dir <- file.path(base.dir, "Analysis_input/PEP_drivers_final_spring_MW/MW15/data_chunks/3_Merged_tables")
+output.dir <- file.path(base.dir, "Analysis_output/Preseason_sensitivity")
+```
+
+</details>
+
+<details>
+
+<summary>Data</summary>
+
+```{r}
+# Load the PEP dataset from the given directory
+PEP.df <- fread(paste(PEP.dir, "pep_MW15_merged.csv", sep="/")) %>% 
+  
+  # Drop the unwanted column 'V1'
+  dplyr::select(-V1) %>% 
+  
+  # Clean the 'Tmax.PS100' column:
+  # Some entries contain extra symbols like "$" (e.g., "7.9388$184"),
+  # which prevents numeric conversion.
+  # parse_number() extracts only the numeric portion (up to the first non-numeric character),
+  # automatically turning invalid parts into proper numbers (e.g., "7.9388$184" → 7.9388).
+  mutate(Tmax.PS100 = parse_number(Tmax.PS100))
+```
+
+</details>
+
+<br>
+
+# 2. Analysis
+
+<details>
+
+<summary>Preseason correlations</summary>
+
+```{r}
+# define phenology classes
+phen_classes <- unique(PEP.df$phenology)
+
+
+#-------------------------------------------------------
+# Save PEP data in chunks
+#-------------------------------------------------------
+
+# empty list
+pep_chunks <- list()
+
+# loop
+for (ph in phen_classes) {
+  message("Processing: ", ph)
+  
+  #filter phenology chunk
+  df_chunk <- PEP.df %>%
+    filter(phenology == ph)
+  
+  # save file as RDS
+  saveRDS(df_chunk, file = file.path(chunkPEP.dir, paste0("pep_MW15_", ph, ".rds")))
+  rm(df_chunk)
+  gc()
+}
+
+
+#-------------------------------------------------------
+# Reshape table to long format
+#-------------------------------------------------------
+
+# empty list
+all_preseason <- list()
+
+# loop
+for (ph in phen_classes) {
+  message("Processing: ", ph)
+  
+  df_chunk <- PEP.df %>%
+    
+    #filter phenology chunk
+    filter(phenology == ph) %>%
+    
+    #select columns
+    dplyr::select(phenology, timeseries, year, MWyear, species, s_id, leaf_out,
+                  starts_with(c("Tmean.PS", "Tmin.PS", "Tmax.PS", "SWrad.PS", "RH.PS"))) %>%
+    #long format
+    pivot_longer(cols = starts_with(c("Tm","SWrad","RH")),
+                 names_to = "preseason", values_to = "value") %>%
+    #create preseason length and variable class columns
+    mutate(preseason_length = readr::parse_number(gsub("[.]", "", preseason)), #keep only numbers in string
+           var_class = gsub("\\..*","", preseason)) %>%
+    dplyr::select(-preseason)
+  
+  # save file as RDS
+  saveRDS(df_chunk, file = file.path(chunk1.dir, paste0("preseason_", ph, ".rds")))
+  rm(df_chunk)
+  gc()
+}
+rm(PEP.df)
+
+
+#-------------------------------------------------------
+# Correlation coefficients
+#-------------------------------------------------------
+
+# load data chunks (chunked per phenology and saved as RDS)
+chunk.files <- list.files(chunk1.dir, pattern="\\.rds$", full.names=TRUE)
+
+# empty list
+results_list <- list()
+
+# loop
+for (file in chunk.files) {
+  message("Processing correlations for: ", tools::file_path_sans_ext(basename(file)))
+  
+  df_chunk <- readRDS(file)
+  
+  res <- df_chunk %>%
+    group_by(phenology, timeseries, species, s_id, MWyear, var_class, preseason_length) %>%
+    summarise(coeff = cor(leaf_out, value, use = "pairwise.complete.obs"),
+              .groups = "drop")
+  
+  # Save each chunk's result separately to avoid holding it all in RAM
+  saveRDS(res, file = file.path(chunk2.dir, paste0("resultsLM_", 
+                                                   tools::file_path_sans_ext(basename(file)), 
+                                                   ".rds")))
+  rm(df_chunk, res)
+  gc()
+}
+
+# Combine all correlation results later:
+resultsLM <- lapply(list.files(chunk2.dir, pattern="resultsLM_.*\\.rds$", full.names=TRUE), readRDS)
+resultsLM <- data.table::rbindlist(resultsLM)
+
+#keep only models with highest absolute correlation coefficients
+resultsLM2 = resultsLM %>%   
+  group_by(phenology,timeseries,MWyear,var_class) %>% 
+  top_n(1, abs(coeff)) %>%
+  ungroup()
+
+#Mean preseason length
+resultsLM2 %>% 
+  group_by(phenology, species, var_class) %>% 
+  summarize(meanPre = mean(preseason_length)) %>% 
+  ungroup()
+```
+
+</details>
+
+<details>
+
+<summary>Plot preseason correlations</summary>
+
+```{r}
+#-------------------------------------------------------
+# Mean across all timeseries and species
+#-------------------------------------------------------
+
+plot.estimate = resultsLM %>%
+  mutate(var_class = factor(var_class, levels = c("RH","SWrad","Tmin","Tmean","Tmax")),
+         phenology = factor(phenology, levels = c("leaf_out","leaf_out_GDD.chill.DL","leaf_out_GDD.chill.hi","leaf_out_GDD.chill.lo","leaf_out_GDD"))) %>% 
+  ggplot()+
+  aes(x=preseason_length, y=coeff, 
+      colour=MWyear, group=MWyear) +
+  geom_hline(yintercept = 0)+
+  stat_summary(fun = mean, geom="line", size = .7) +
+  scale_color_gradientn(colours = rainbow(5))+
+  stat_summary(fun.data = "mean_cl_normal", geom="errorbar", linewidth = 0.5, width=0) +
+  stat_summary(fun.data = "mean_cl_normal", geom="point", size = 1) +
+  xlab("Preseason length (days)") +
+  ylab("Correlation coefficient") +
+  coord_cartesian(ylim = c(-0.85, 0.65), xlim=c(14,116))+
+  plotTheme1+
+  theme(legend.position   = "top",
+        legend.title      = element_blank(),
+        legend.key        = element_blank(),
+        legend.text.align = 0,
+        #strip.text.x      = element_blank()
+        ) +
+  facet_grid(var_class~phenology)
+rm(resultsLM)
+
+plot.estimate
+
+#-------------------------------------------------------
+# Plot best preseason lengths
+#-------------------------------------------------------
+
+ModelLabs <- c("RH","SWR",expression("T"["min"]), expression("T"["mean"]),expression("T"["max"]))
+
+plot.length = resultsLM2 %>%
+  mutate(var_class = factor(var_class, levels = c("RH","SWrad","Tmin","Tmean","Tmax")),
+         phenology = factor(phenology, levels = c("leaf_out","leaf_out_GDD.chill.DL","leaf_out_GDD.chill.hi","leaf_out_GDD.chill.lo","leaf_out_GDD"))) %>% 
+  dplyr::select(phenology,species,var_class,preseason_length)%>%
+  ggplot()+
+  aes(x=phenology, y=preseason_length, colour=var_class, fill=var_class, alpha=0.5) +
+  geom_boxplot(outlier.colour = NA)+
+  scale_color_manual(values = wes_palette("Zissou1", n = 5)) +
+  scale_fill_manual(values = wes_palette("Zissou1", n = 5)) +
+  scale_x_discrete(labels= ModelLabs)+
+  coord_cartesian(ylim = c(10, 117))+
+  xlab("") +
+  ylab("Best preseason length (days)") +
+  plotTheme1+
+  facet_wrap(~var_class, ncol=1)
+
+plot.length
+
+#-------------------------------------------------------
+# Arrange and save plots #
+#-------------------------------------------------------
+
+pdf(paste(output.dir,"Preseason_estimates_MW15.pdf",sep="/"), width=6, height=8, useDingbats=FALSE)
+plot.estimate
+dev.off()
+rm(plot.estimate)
+
+pdf(paste(output.dir,"Preseason_length_MW15.pdf",sep="/"), width=4, height=7, useDingbats=FALSE)
+plot.length
+dev.off()
+rm(plot.length)
+```
+
+</details>
+
+<details>
+
+<summary>Add preseason data to PEP data</summary>
+
+```{r}
+#-------------------------------------------------------
+# Merge best preseason climate variables into PEP data
+# (chunked by phenology group to avoid memory overload)
+#-------------------------------------------------------
+
+for (ph in phen_classes) {
+
+  # Build expected file names
+  file1 <- paste0("preseason_", ph, ".rds") # preseason chunk
+  file2 <- paste0("pep_MW15_", ph, ".rds")  # PEP chunk
+  
+  # Build full paths
+  path1 <- file.path(chunk1.dir, file1)
+  path2 <- file.path(chunkPEP.dir, file2)
+  
+  # Check both files exist before proceeding
+  if (!file.exists(path1) | !file.exists(path2)) {
+    warning(paste("Skipping phenology:", ph, " (missing file)"))
+    next
+  }
+
+  message("Processing phenology: ", ph)
+
+  # Load datasets
+  preseason.df <- readRDS(path1) %>% 
+    dplyr::select(-c(s_id, leaf_out, species))
+  PEP.df <- readRDS(path2)
+  results.df <- resultsLM2 %>% filter(phenology == ph)
+  
+  #-------------------------------------------------------
+  # 1. Add best preseason *climate variable values*
+  #-------------------------------------------------------
+  
+  # Keep only rows that match the best models (from resultsLM2),
+  # then pivot to a wide format so each variable is its own column.
+  preseason.filtered <- preseason.df %>%
+    semi_join(results.df, by = c("phenology", "timeseries", "MWyear", "var_class", "preseason_length")) %>%
+    dplyr::select(phenology, timeseries, MWyear, year, var_class, value) %>%
+    pivot_wider(names_from = var_class, values_from = value)
+  
+  # Join these climate variables into the main PEP data (filtering to this phenology group)
+  PEP.joined <- PEP.df %>% 
+    filter(phenology == ph) %>% 
+    inner_join(preseason.filtered, by = c("phenology", "MWyear", "year", "timeseries"))
+  rm(preseason.filtered, PEP.df)
+  gc()
+  
+  
+  #-------------------------------------------------------
+  # 2. Add preseason *lengths* (number of days per variable)
+  #-------------------------------------------------------
+  
+  preseason.length.filtered <- preseason.df %>%
+    filter(phenology == ph) %>%
+    semi_join(results.df, by=c('phenology','timeseries','MWyear','var_class','preseason_length')) %>%
+    dplyr::select(phenology, timeseries, MWyear, year, var_class, preseason_length) %>%
+    mutate(var_class = paste(var_class, "length", sep="_")) %>% 
+    pivot_wider(names_from = var_class, values_from = preseason_length)
+  
+  # Join the lengths into the combined PEP data
+  PEP.joined <- PEP.joined %>%
+    inner_join(preseason.length.filtered, by = c("phenology", "MWyear", "year", "timeseries"))
+  rm(preseason.length.filtered, preseason.df)
+  
+  
+  #-------------------------------------------------------
+  # 3. For each of Tmean and Tmax, extract the correct SD and slope values
+  #    based on the chosen preseason length (10, 20, ..., 120 days)
+  #-------------------------------------------------------
+  
+  for (var in c("Tmean", "Tmax")) {
+    len_col <- paste0(var, "_length")  # The column holding the chosen length
+    
+    # Identify all available intra-annual SD and slope columns (e.g., Tmean.IntraSD.PS10)
+    sd_cols <- grep(paste0("^", var, "\\.IntraSD\\.PS"), names(PEP.joined), value=TRUE)
+    sd_lookup <- setNames(sd_cols, sub(paste0(var, "\\.IntraSD\\.PS"), "", sd_cols))  # map length -> colname
+    
+    slope_cols <- grep(paste0("^", var, "\\.slope\\.PS"), names(PEP.joined), value=TRUE)
+    slope_lookup <- setNames(slope_cols, sub(paste0(var, "\\.slope\\.PS"), "", slope_cols))
+    
+    # For each row, find which column corresponds to its chosen preseason length
+    sd_targets <- sd_lookup[as.character(PEP.joined[[len_col]])]
+    slope_targets <- slope_lookup[as.character(PEP.joined[[len_col]])]
+    
+    # Extract values row-wise (this is the slowest step; see note below for faster options)
+    PEP.joined[[paste0(var, ".IntraSD")]] <- mapply(function(row, col) {
+      if (!is.na(col)) PEP.joined[[col]][row] else NA_real_
+    }, seq_len(nrow(PEP.joined)), sd_targets)
+    
+    PEP.joined[[paste0(var, ".slope")]] <- mapply(function(row, col) {
+      if (!is.na(col)) PEP.joined[[col]][row] else NA_real_
+    }, seq_len(nrow(PEP.joined)), slope_targets)
+  }
+  
+  
+  #-------------------------------------------------------
+  # 4. Compute start dates of climate-sensitive periods and clean up
+  #-------------------------------------------------------
+  
+  PEP.joined <- PEP.joined %>%
+    mutate(
+      Tmean_start = leaf_out_mean - Tmean_length,
+      Tmin_start  = leaf_out_mean - Tmin_length,
+      Tmax_start  = leaf_out_mean - Tmax_length,
+      SWrad_start = leaf_out_mean - SWrad_length,
+      RH_start    = leaf_out_mean - RH_length
+    ) %>%
+    dplyr::select(-contains(".PS"))  # Drop original per-PS columns (no longer needed)
+  
+  # Save the final combined dataset for this phenology group
+  saveRDS(PEP.joined, file = file.path(chunk3.dir, paste0("final_", ph, ".rds")))
+  
+  # Free memory aggressively before next loop
+  rm(PEP.joined)
+  gc()
+}
+
+
+#-------------------------------------------------------
+# 5. Combine all processed phenology groups into one dataset
+#-------------------------------------------------------
+
+# List all the final per-phenology files
+final_chunks <- list.files(chunk3.dir, pattern = "^final_.*\\.rds$", full.names = TRUE)
+
+# Load and combine them efficiently
+final_PEP <- rbindlist(lapply(final_chunks, readRDS))
+
+# Save the combined dataset 
+fwrite(final_PEP, file = file.path(PEP.dir, "pep_MW15_merged_final.csv"))
+```
+
+</details>
+
+<br>
+
+# 3. Reproducibility
+
+<details>
+
+<summary>Show</summary>
+
+```{r}
+## datetime
+Sys.time()
+
+## session info
+sessionInfo()
+```
+
+</details>

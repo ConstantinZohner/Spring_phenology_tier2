@@ -1,0 +1,581 @@
+---
+title: "Spring phenology tier2 project"
+subtitle: "Model performance figures (PEP725 data)"
+author: "Constantin Zohner"
+date: "Last run: `r format(Sys.Date(), '%d %B %Y')`"
+
+format:
+  html:
+    toc: false
+    theme: default
+    highlight-style: haddock
+    df-print: paged
+    embed-resources: true
+
+execute:
+  #warning: false
+  message: false
+  echo: true
+  output: true
+
+always_allow_html: true
+editor: visual
+editor_options:
+  chunk_output_type: inline
+---
+
+<br>
+
+### Models
+
+-   Forcing-only: Constant site-level GDD requirement
+-   Low chilling: GDD requirement modified by chilling factor (C\* = 75)
+-   High chilling: GDD requirement modified by chilling factor (C\* = 150)
+-   Chilling & Photoperiod: GDD requirement modified by chilling (fC) and photoperiod factors (fP)
+
+<br>
+
+# 1. Setup
+
+<details>
+
+<summary>Packages</summary>
+
+```{r, message = F}
+require(tidyverse)
+require(data.table)
+require(ggplot2)
+```
+
+</details>
+
+<details>
+
+<summary>Directories</summary>
+
+```{r}
+#-------------------------------------------------
+# Define the base directory
+#-------------------------------------------------
+
+base.dir <- "/Users/goalie/Desktop/PhD/Publication_material/40_Spring_phenology_tier2/PEP725_Analysis"
+
+
+#-------------------------------------------------
+# Build specific directories from the base
+#-------------------------------------------------
+
+# PEP LOO-CV data
+Model.dir = file.path(base.dir, "Analysis_input/PEP_models")
+
+# Moving window model results
+PEP.dir = file.path(base.dir, "Analysis_input/PEP_drivers_final_spring/Merged_file")
+
+# Output
+output.dir = file.path(base.dir, "Analysis_output/ModelFigures/Moving_windows/Model_evaluation")
+```
+
+</details>
+
+<details>
+
+<summary>Plot theme</summary>
+
+```{r}
+plotTheme1 = theme(legend.position   = "right",
+                   legend.background = element_rect(fill=NA, linewidth=0.5, linetype="solid"),
+                   legend.text       = element_text(color="black",face = "italic"),
+                   panel.grid.major  = element_blank(),
+                   panel.grid.minor  = element_blank(),
+                   panel.background  = element_blank(),
+                   panel.border      = element_rect(colour = "black", fill=NA),
+                   axis.line         = element_line(color = "black"),
+                   axis.text         = element_text(colour = "black"),
+                   axis.text.x       = element_text(angle = 45, hjust=1),
+                   strip.background  = element_rect(fill=NA),
+                   plot.title        = element_text(face="bold"))
+```
+
+</details>
+
+<details>
+
+<summary>Functions</summary>
+
+```{r}
+#-------------------------------------------------------
+# RMSE — Root Mean Squared Error
+#-------------------------------------------------------
+
+rmse <- function(obs, pred, w = NULL) {
+  # If weights are supplied, compute a weighted RMSE.
+  # weighted.mean() divides by sum(w) (after dropping NA pairs),
+  # so this yields sqrt( Σ w_i * (obs - pred)^2 / Σ w_i ).
+  if (!is.null(w)) return(sqrt(weighted.mean((obs - pred)^2, w, na.rm = TRUE)))
+  
+  # Unweighted RMSE: sqrt( mean squared error ), dropping NA pairs.
+  sqrt(mean((obs - pred)^2, na.rm = TRUE))
+}
+
+
+#-------------------------------------------------------
+# cross-validated R2 (a.k.a. Nash–Sutcliffe efficiency)
+#-------------------------------------------------------
+
+# CV-friendly, penalizes bias & scale
+# R2 = 1 - SSE/SST, where SSE = Σ (obs - pred)^2,
+# and SST = Σ (obs - mean(obs))^2
+r2_ss <- function(obs, pred) {
+  # Require at least 2 non-NA pairs to define a variance
+  if (sum(!is.na(obs) & !is.na(pred)) < 2) return(NA_real_)
+  
+  # 1 - (sum of squared errors) / (total sum of squares)
+  1 - sum((obs - pred)^2, na.rm = TRUE) /
+        sum((obs - mean(obs, na.rm = TRUE))^2, na.rm = TRUE)
+}
+
+
+#-------------------------------------------------------
+# lower (lo) and upper (hi) confidence intervals of mean
+#-------------------------------------------------------
+
+lo <- function(x, conf.level = 0.95) {
+  x <- x[is.finite(x)]
+  n <- length(x)
+  if (n < 2) return(NA_real_)
+  m <- mean(x); se <- stats::sd(x) / sqrt(n)
+  tcrit <- stats::qt((1 + conf.level)/2, df = n - 1)
+  m - tcrit * se
+}
+
+
+hi <- function(x, conf.level = 0.95) {
+  x <- x[is.finite(x)]
+  n <- length(x)
+  if (n < 2) return(NA_real_)
+  m <- mean(x); se <- stats::sd(x) / sqrt(n)
+  tcrit <- stats::qt((1 + conf.level)/2, df = n - 1)
+  m + tcrit * se
+}
+```
+
+</details>
+
+<details>
+
+<summary>Load and prepare data</summary>
+
+```{r}
+#-------------------------------------------------------
+# PEP725 data
+#-------------------------------------------------------
+
+PEP.df <- fread(paste(PEP.dir, "pep_drivers_spring_data_clean.csv", sep="/")) %>% 
+  dplyr::select(timeseries, year, alt_dem)
+
+
+#-------------------------------------------------------
+# Model predictions (claibration and LOO-CV data)
+#-------------------------------------------------------
+
+LOO_CV.df      <- fread(paste(Model.dir, "pep_model_predictions_LOO.csv", sep="/")) 
+Calibration.df <- fread(paste(Model.dir, "pep_model_predictions.csv", sep="/")) 
+
+
+#-------------------------------------------------------
+# Merge and filter data
+#-------------------------------------------------------
+
+pred_cols <- c("leaf_out_GDD",
+               "leaf_out_GDD.chill.lo",
+               "leaf_out_GDD.chill.hi",
+               "leaf_out_GDD.chill.DL")
+
+LOO_CV.df <- left_join(LOO_CV.df, PEP.df, by = c("timeseries", "year")) %>%
+  group_by(timeseries) %>%
+  filter(!(alt_dem > 600), year >= 1966) %>%
+  filter(n() >= 20) %>%
+  ungroup() %>%
+  dplyr::select(-c(alt_dem, V1)) %>%
+  # keep obs as 'obs', pivot preds to 'pred' and model name to 'model'
+  rename(obs = leaf_out) %>%
+  pivot_longer(cols = all_of(pred_cols),
+               names_to = "model",
+               values_to = "pred")
+
+Calibration.df <- left_join(Calibration.df, PEP.df, by = c("timeseries", "year")) %>%
+  group_by(timeseries) %>%
+  filter(!(alt_dem > 600), year >= 1966) %>%
+  filter(n() >= 20) %>%
+  ungroup() %>%
+  dplyr::select(-c(alt_dem, V1)) %>%
+  # keep obs as 'obs', pivot preds to 'pred' and model name to 'model'
+  rename(obs = leaf_out) %>%
+  pivot_longer(cols = all_of(pred_cols),
+               names_to = "model",
+               values_to = "pred")
+
+
+#-------------------------------------------------------
+# Moving windows
+#-------------------------------------------------------
+
+year.vector <- seq(min(PEP.df$year), max(PEP.df$year) - 14L)
+
+LOOCV.MW.df <- lapply(year.vector, function(MW.year) {
+  LOO_CV.df %>%
+    filter(year >= MW.year, year < MW.year + 15L) %>%
+    group_by(timeseries, model) %>%
+    filter(n() >= 12) %>%    # keep reasonably long series within the window
+    ungroup() %>%
+    mutate(MWyear = MW.year)
+}) %>% bind_rows()
+
+Cal.MW.df <- lapply(year.vector, function(MW.year) {
+  Calibration.df %>%
+    filter(year >= MW.year, year < MW.year + 15L) %>%
+    group_by(timeseries, model) %>%
+    filter(n() >= 12) %>%    # keep reasonably long series within the window
+    ungroup() %>%
+    mutate(MWyear = MW.year)
+}) %>% bind_rows()
+```
+
+</details>
+
+<br>
+
+# 2. Analysis
+
+<details>
+
+<summary>Summarize calibration models</summary>
+
+```{r, message=F}
+#=======================================================
+# Summarize model results
+#=======================================================
+
+
+
+#-------------------------------------------------------
+# Compute per-timeseries × model × window metrics
+#-------------------------------------------------------
+
+Cal_metrics_by_ts <- Cal.MW.df %>%
+  group_by(species, timeseries, model, MWyear) %>%
+  summarise(
+    #n     = sum(!is.na(obs) & !is.na(pred)),
+    RMSE  = rmse(obs, pred),
+    MAE   = mean(abs(obs - pred), na.rm = TRUE),
+    #Bias  = mean(pred - obs, na.rm = TRUE),              # + means over-prediction
+    r     = suppressWarnings(cor(obs, pred, use = "complete.obs")),
+    #R2    = r2_ss(obs, pred),                            # 1 - SSE/SST
+    #slope = if (n >= 2) coef(lm(obs ~ pred))[2] else NA_real_,
+    #intercept = if (n >= 2) coef(lm(obs ~ pred))[1] else NA_real_,
+    #AIC_lm = if (n >= 3) AIC(lm(obs ~ pred)) else NA_real_
+  , .groups = "drop")
+
+
+#-------------------------------------------------------
+# Summarise time series-level results at species level
+#-------------------------------------------------------
+
+# Define used metrics
+vars <- c("RMSE","MAE","r")
+
+# Define desired model order
+phenology_levels <- c("leaf_out_GDD",
+                      "leaf_out_GDD.chill.lo",  
+                      "leaf_out_GDD.chill.hi",
+                      "leaf_out_GDD.chill.DL")
+
+Cal_metrics_by_species <- Cal_metrics_by_ts %>%
+  group_by(species, model, MWyear) %>%
+  summarise(
+    across(all_of(vars),
+           list(. = ~mean(.x, na.rm = TRUE)),
+           .names = "{.col}")
+  , .groups = "drop") %>% 
+  pivot_longer(cols = all_of(vars),
+               names_to = "metric",
+               values_to = "val") %>% 
+  mutate(model  = factor(model, levels = phenology_levels),
+         metric = factor(metric, levels = vars))
+
+
+#-------------------------------------------------------
+# Summarise species-level results
+#-------------------------------------------------------
+
+Cal_metrics_by_model = Cal_metrics_by_species %>% 
+  group_by(model, MWyear, metric) %>%
+  summarise(
+    mean = mean(val, na.rm = TRUE),
+    lo   = lo(val),
+    hi   = hi(val)) %>% 
+  mutate(model = factor(model, levels = phenology_levels),
+         metric = factor(metric, levels = vars))
+```
+
+</details>
+
+<details>
+
+<summary>Summarize leave-one-out cross-validation (LOO-CV) models</summary>
+
+```{r, message=F}
+#=======================================================
+# Summarize model results
+#=======================================================
+
+
+
+#-------------------------------------------------------
+# Compute per-timeseries × model × window metrics
+#-------------------------------------------------------
+
+LOOCV_metrics_by_ts <- LOOCV.MW.df %>%
+  group_by(species, timeseries, model, MWyear) %>%
+  summarise(
+    #n     = sum(!is.na(obs) & !is.na(pred)),
+    RMSE  = rmse(obs, pred),
+    MAE   = mean(abs(obs - pred), na.rm = TRUE),
+    #Bias  = mean(pred - obs, na.rm = TRUE),              # + means over-prediction
+    r     = suppressWarnings(cor(obs, pred, use = "complete.obs")),
+    #R2    = r2_ss(obs, pred),                            # 1 - SSE/SST
+    #slope = if (n >= 2) coef(lm(obs ~ pred))[2] else NA_real_,
+    #intercept = if (n >= 2) coef(lm(obs ~ pred))[1] else NA_real_,
+    #AIC_lm = if (n >= 3) AIC(lm(obs ~ pred)) else NA_real_
+  , .groups = "drop")
+
+
+#-------------------------------------------------------
+# Summarise time series-level results at species level
+#-------------------------------------------------------
+
+LOOCV_metrics_by_species <- LOOCV_metrics_by_ts %>%
+  group_by(species, model, MWyear) %>%
+  summarise(
+    across(all_of(vars),
+           list(. = ~mean(.x, na.rm = TRUE)),
+           .names = "{.col}")
+  , .groups = "drop") %>% 
+  pivot_longer(cols = all_of(vars),
+               names_to = "metric",
+               values_to = "val") %>% 
+  mutate(model  = factor(model, levels = phenology_levels),
+         metric = factor(metric, levels = vars))
+
+
+#-------------------------------------------------------
+# Summarise species-level results
+#-------------------------------------------------------
+
+LOOCV_metrics_by_model = LOOCV_metrics_by_species %>% 
+  group_by(model, MWyear, metric) %>%
+  summarise(
+    mean = mean(val, na.rm = TRUE),
+    lo   = lo(val),
+    hi   = hi(val)) %>% 
+  mutate(model = factor(model, levels = phenology_levels),
+         metric = factor(metric, levels = vars))
+```
+
+</details>
+
+<br>
+
+# 3. Create plots
+
+<details>
+
+<summary>Calibration model plots</summary>
+
+```{r}
+#-------------------------------------------------------
+# Create plot using ggplot2
+#-------------------------------------------------------
+
+Cal.plot = Cal_metrics_by_species %>% 
+  
+  ggplot() + 
+  
+   # (1) Horizontal reference line at y=0
+  geom_hline(yintercept=0.5, color="white") +
+  
+  # (2) Add ribbon for CI of smoothed mean trend
+  geom_ribbon(data=Cal_metrics_by_model,
+              aes(x = MWyear, y = mean, ymin = lo, ymax = hi),
+              fill = "darkgrey", color=NA, alpha = 0.9) + 
+  
+  # (3) Add individual species time series
+  geom_line(aes(x = MWyear, y = val, group=species, color=species), linewidth = 0.4) +
+  
+  # (4) Linear trend over the species-level data (dashed)
+  geom_smooth(aes(x = MWyear, y = val),
+              method='lm', formula = y~x, se = FALSE, 
+              linewidth=1, linetype="dashed", color="black") +
+  
+  # (5) Add overall mean trend line
+  geom_line(data=Cal_metrics_by_model,
+            aes(x = MWyear, y = mean), color="black", linewidth=1) +
+  
+  # (6) Regression annotation on the per-species data
+  ggpubr::stat_regline_equation(
+    aes(x = MWyear, y = val, 
+        label = paste(..eq.label.., ..rr.label.., sep = "~~~~")),
+    formula = y ~ x,
+    label.x.npc = 0.1,  # 2% from left
+    label.y.npc = 0.05,  # 2% from top
+    show.legend = FALSE
+  ) +
+  
+  # (7) Correlation annotation on the per-species data
+  ggpubr::stat_cor(aes(x = MWyear, y = val), 
+                   color = "black", 
+                   r.accuracy =0.01, p.accuracy =0.001, 
+                   show.legend=F,
+                   label.x.npc = 0.1,
+                   label.y.npc = 0.12) +
+  
+  # Manual color palette for species
+  scale_color_manual("Species", 
+                     values = c('#a6cee3','#1f78b4','#b2df8a','#33a02c','#fb9a99',
+                                '#e31a1c','#fdbf6f','#ff7f00','#cab2d6','#6a3d9a'))+
+  
+  # Zoom in on period of interest
+  coord_cartesian(xlim=c(1967.9,2007.1))+
+  
+  # Axis labels
+  xlab("") + ylab('Pearson`s R                   MAE                   RMSE ')+
+  
+  # Custom x-axis labels showing moving windows
+  scale_x_continuous(breaks = seq(1966,2008,by=5),
+                     labels = c('1966-1980','1971-1985','1976-1990',
+                                '1981-1995','1986-2000','1991-2005',
+                                '1996-2010','2001-2015','2006-2020')) +
+  
+  facet_grid(metric~model, scales="free_y")+
+  
+  # Apply predefined theme
+  plotTheme1
+
+
+#-------------------------------------------------------
+# Save plot as .pdf
+#-------------------------------------------------------
+
+ggsave(Cal.plot, file="Calibration.pdf", path=output.dir,
+       width=12, height=7.5)
+
+
+Cal.plot
+```
+
+</details>
+
+<details>
+
+<summary>LOO-CV model plots</summary>
+
+```{r}
+#-------------------------------------------------------
+# Create plot using ggplot2
+#-------------------------------------------------------
+
+LOOCV.plot = LOOCV_metrics_by_species %>% 
+  
+  ggplot() + 
+  
+   # (1) Horizontal reference line at y=0
+  geom_hline(yintercept=0.55, color="white") +
+  
+  # (2) Add ribbon for CI of smoothed mean trend
+  geom_ribbon(data=LOOCV_metrics_by_model,
+              aes(x = MWyear, y = mean, ymin = lo, ymax = hi),
+              fill = "darkgrey", color=NA, alpha = 0.9) + 
+  
+  # (3) Add individual species time series
+  geom_line(aes(x = MWyear, y = val, group=species, color=species), linewidth = 0.4) +
+  
+  # (4) Linear trend over the species-level data (dashed)
+  geom_smooth(aes(x = MWyear, y = val),
+              method='lm', formula = y~x, se = FALSE, 
+              linewidth=1, linetype="dashed", color="black") +
+  
+  # (5) Add overall mean trend line
+  geom_line(data=LOOCV_metrics_by_model,
+            aes(x = MWyear, y = mean), color="black", linewidth=1) +
+  
+  # (6) Regression annotation on the per-species data
+  ggpubr::stat_regline_equation(
+    aes(x = MWyear, y = val, 
+        label = paste(..eq.label.., ..rr.label.., sep = "~~~~")),
+    formula = y ~ x,
+    label.x.npc = 0.1,  # 2% from left
+    label.y.npc = 0.05,  # 2% from top
+    show.legend = FALSE
+  ) +
+  
+  # (7) Correlation annotation on the per-species data
+  ggpubr::stat_cor(aes(x = MWyear, y = val), 
+                   color = "black", 
+                   r.accuracy =0.01, p.accuracy =0.001, 
+                   show.legend=F,
+                   label.x.npc = 0.1,
+                   label.y.npc = 0.12) +
+  
+  # Manual color palette for species
+  scale_color_manual("Species", 
+                     values = c('#a6cee3','#1f78b4','#b2df8a','#33a02c','#fb9a99',
+                                '#e31a1c','#fdbf6f','#ff7f00','#cab2d6','#6a3d9a'))+
+  
+  # Zoom in on period of interest
+  coord_cartesian(xlim=c(1967.9,2007.1))+
+  
+  # Axis labels
+  xlab("") + ylab('Pearson`s R                   MAE                   RMSE ')+
+  
+  # Custom x-axis labels showing moving windows
+  scale_x_continuous(breaks = seq(1966,2008,by=5),
+                     labels = c('1966-1980','1971-1985','1976-1990',
+                                '1981-1995','1986-2000','1991-2005',
+                                '1996-2010','2001-2015','2006-2020')) +
+  
+  facet_grid(metric~model, scales="free_y")+
+  
+  # Apply predefined theme
+  plotTheme1
+
+
+#-------------------------------------------------------
+# Save plot as .pdf
+#-------------------------------------------------------
+
+ggsave(LOOCV.plot, file="LOO_cross_validation.pdf", path=output.dir,
+       width=12, height=7.5)
+
+
+LOOCV.plot
+```
+
+</details>
+
+<br>
+
+# 4. Reproducibility
+
+<details>
+
+<summary>show</summary>
+
+```{r}
+# Datetime
+Sys.time()
+
+# Session info
+sessionInfo()
+```
+
+</details>

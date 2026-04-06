@@ -1,0 +1,308 @@
+---
+title: "Spring phenology tier2 project"
+subtitle: "Moving window-based St versus leaf-out date correlation figures (PEP725 data)"
+author: "Constantin Zohner"
+date: "Last run: `r format(Sys.Date(), '%d %B %Y')`"
+
+format:
+  html:
+    toc: false
+    theme: default
+    highlight-style: haddock
+    df-print: paged
+    embed-resources: true
+
+execute:
+  #warning: false
+  message: false
+  echo: true
+  output: true
+
+always_allow_html: true
+editor: visual
+editor_options:
+  chunk_output_type: inline
+---
+
+<br>
+
+# 1. Setup
+
+<details>
+
+<summary>Packages</summary>
+
+```{r, message = F}
+require(tidyverse)
+require(data.table)
+require(ggplot2)
+require(lme4)
+require(broom.mixed)
+require(ggh4x)
+```
+
+</details>
+
+<details>
+
+<summary>Directories</summary>
+
+```{r}
+#-------------------------------------------------
+# Define the base directory
+#-------------------------------------------------
+
+base.dir <- "/Users/goalie/Desktop/PhD/Publication_material/40_Spring_phenology_tier2/PEP725_Analysis"
+
+
+#-------------------------------------------------
+# Build specific directories from the base
+#-------------------------------------------------
+
+# PEP moving window data
+PEP.dir         = file.path(base.dir, "Analysis_input/PEP_drivers_final_spring_MW/MW15/Merged_file")
+
+# Moving window model results
+MW_model.dir    = file.path(base.dir, "Analysis_output/ModelResults/Moving_window_analysis/Individual_files_models")
+
+# Output
+output.dir      = file.path(base.dir, "Analysis_output/ModelFigures/Moving_windows/St_leafout_correlations")
+```
+
+</details>
+
+<details>
+
+<summary>Plot theme</summary>
+
+```{r}
+plotTheme1 = theme(legend.position   = "right",
+                   legend.background = element_rect(fill=NA, linewidth=0.5, linetype="solid"),
+                   legend.text       = element_text(color="black",face = "italic"),
+                   panel.grid.major  = element_blank(),
+                   panel.grid.minor  = element_blank(),
+                   panel.background  = element_blank(),
+                   panel.border      = element_rect(colour = "black", fill=NA),
+                   axis.line         = element_line(color = "black"),
+                   axis.text         = element_text(colour = "black"),
+                   strip.background  = element_rect(fill=NA),
+                   plot.title        = element_text(face="bold"))
+```
+
+</details>
+
+<details>
+
+<summary>Data</summary>
+
+```{r}
+#-------------------------------------------------------
+# PEP725 moving window data
+#-------------------------------------------------------
+
+PEP.df <- fread(paste(PEP.dir, "pep_MW15_merged_final.csv", sep="/")) %>% 
+  group_by(phenology, species, timeseries, MWyear) %>%
+  mutate(leaf_out_mean = mean(leaf_out, na.rm=T)) %>% 
+  ungroup() %>% 
+  # keep only one row per timeseries (leaf-out mean)
+  distinct(phenology, species, timeseries, MWyear, leaf_out_mean, .keep_all = F) %>% 
+  # calculate leaf-out mean anomalies within sites
+  group_by(phenology, species, timeseries) %>% 
+  mutate(leaf_out_mean_anomaly = leaf_out_mean - mean(leaf_out_mean)) %>% 
+  ungroup()
+
+
+#-------------------------------------------------------
+# Moving window model data
+#-------------------------------------------------------
+
+model.df = rbindlist(
+  lapply(
+    list.files(path = MW_model.dir, pattern = "\\.csv$", full.names = TRUE),
+    fread),
+  fill = TRUE
+  ) %>% 
+  filter(equation %in% c("St_abs", "St_log", "St_z")) %>% 
+  dplyr::select(phenology, species, timeseries, MWyear, equation, estimate) %>% 
+  # calculate St anomalies within sites
+  group_by(phenology, species, timeseries, equation) %>% 
+  mutate(St_anomaly = estimate*-1 - mean(estimate*-1)) %>% 
+  ungroup()
+
+
+#-------------------------------------------------------
+# Merge PEP and model data
+#-------------------------------------------------------
+
+final.df = inner_join(PEP.df, 
+                      model.df, 
+                      by=c("phenology", "species", "timeseries", "MWyear"))
+```
+
+</details>
+
+<br>
+
+# 2. Analysis
+
+<details>
+
+<summary>Summarize models</summary>
+
+```{r, message=F}
+resultsLM = final.df %>% 
+  dplyr::group_by(phenology, equation) %>% 
+  dplyr::group_modify(~{
+     # run model
+    model <- 
+      lmer(St_anomaly ~ leaf_out_mean_anomaly + (1|timeseries) + (1|species), 
+           data = .x, REML = FALSE)
+    # fixed effects table
+    tdy <- broom.mixed::tidy(model, effects = "fixed")  # term, estimate, std.error, statistic
+  }) %>% 
+  dplyr::filter(term == "leaf_out_mean_anomaly")
+resultsLM
+
+resultsLM.species = final.df %>% 
+  dplyr::group_by(phenology, equation, species) %>% 
+  dplyr::group_modify(~{
+     # run model
+    model <- 
+      lmer(St_anomaly ~ leaf_out_mean_anomaly + (1|timeseries), 
+           data = .x, REML = FALSE)
+    # fixed effects table
+    tdy <- broom.mixed::tidy(model, effects = "fixed")  # term, estimate, std.error, statistic
+  }) %>% 
+  dplyr::filter(term == "leaf_out_mean_anomaly")
+resultsLM.species
+```
+
+</details>
+
+<details>
+
+<summary>Plot correlations</summary>
+
+```{r, message=FALSE}
+phenology_levels <- c("leaf_out","leaf_out_GDD","leaf_out_GDD.chill.lo","leaf_out_GDD.chill.hi","leaf_out_GDD.chill.DL")
+
+
+#-------------------------------------------------------
+# Species-level
+#-------------------------------------------------------
+
+Correlation.plot = final.df %>% 
+  # order phenology categories
+  mutate(phenology = factor(phenology, levels = phenology_levels)) %>% 
+  
+  ggplot(aes(x = leaf_out_mean_anomaly, y = St_anomaly, color=species)) + 
+    # vertical and horizontal zero lines
+    geom_vline(xintercept=0) +
+    geom_hline(yintercept=0) +
+    # linear regression lines
+    geom_smooth(method=lm, se=T) + 
+    # Linear trend over the aggregated series (dashed)
+    geom_smooth(data=final.df %>%  
+                  mutate(phenology = factor(phenology, levels = phenology_levels)), 
+                aes(x = leaf_out_mean_anomaly, y = St_anomaly),
+                method='lm', formula = y~x, se = FALSE, 
+                linewidth=1, linetype="dashed", color="black") +
+    # facet-specific annotation (one row per phenology)
+    geom_text(data = resultsLM %>% 
+                mutate(phenology = factor(phenology, levels = phenology_levels)),
+              aes(x = Inf, y = rep(c(3.4,.35, .05), 5), 
+                  label = paste0(round(estimate,4), " ± ", 
+                                 round(1.96*std.error,4), " St per day")),
+              inherit.aes = FALSE, hjust = 1.05, vjust = 1.2, size = 3.5) +
+    # palette
+    scale_color_manual(values = c('#a6cee3','#1f78b4','#b2df8a','#33a02c','#fb9a99',
+                                  '#e31a1c','#fdbf6f','#ff7f00','#cab2d6','#6a3d9a')) +
+    # x and y labels
+    xlab("Leaf-out anomaly") + ylab('St anomaly') +
+    # x bounds
+    coord_cartesian(xlim = c(-21,22)) +
+    # facetting
+    facet_grid(equation~phenology, scales="free_y") +
+    # pre-defined plot theme
+    plotTheme1
+
+# Save plot
+ggsave(Correlation.plot, file = paste0("St_leafout_correlation.pdf"),
+       path = output.dir, width = 12, height = 6)
+
+print(Correlation.plot)
+  
+
+#-------------------------------------------------------
+# All species (density 2d)
+#-------------------------------------------------------
+
+Correlation.plot2 = final.df %>% 
+  # order phenology categories
+  mutate(phenology = factor(phenology, levels = phenology_levels)) %>% 
+  
+  ggplot(aes(x = leaf_out_mean_anomaly, y = St_anomaly)) + 
+  geom_bin2d(bins = 200) +
+  scale_fill_gradientn(
+  colours = c("grey96","grey96","#c7e9f1","#c7e9f1","#41b6c4","#225ea8", "#0c2c84"),
+  trans = "log10")+
+  
+  # vertical and horizontal zero lines
+  geom_vline(xintercept=0, linetype="dashed") +
+  geom_hline(yintercept=0, linetype="dashed") +
+  
+  # linear regression lines
+  geom_smooth(method=lm, se=F,
+              linewidth=1, color="black") + 
+  # facet-specific annotation (one row per phenology)
+  geom_text(data = resultsLM %>% 
+              mutate(phenology = factor(phenology, levels = phenology_levels)),
+              aes(x = Inf, y = rep(c(5,.6, .08), 5), 
+                  label = paste0(round(estimate,4), " ± ", 
+                                 round(1.96*std.error,4), " St per day")),
+              inherit.aes = FALSE, hjust = 1.05, vjust = 1.2, size = 3.5) +
+    # palette
+    scale_color_manual(values = c('#a6cee3','#1f78b4','#b2df8a','#33a02c','#fb9a99',
+                                  '#e31a1c','#fdbf6f','#ff7f00','#cab2d6','#6a3d9a')) +
+    # x and y labels
+    xlab("Leaf-out anomaly") + ylab('St anomaly') +
+    # x bounds
+    coord_cartesian(xlim = c(-20,20)) +
+    # facetting
+    facet_grid2(equation~phenology, scales="free_y") +
+  facetted_pos_scales(
+    y = list(
+      equation == "St_abs" ~ scale_y_continuous(limits = c(-6, 6)),
+      equation == "St_log" ~ scale_y_continuous(limits = c(-.7, .7)),
+      equation == "St_z"   ~ scale_y_continuous(limits = c(-0.1, 0.1))
+    )
+  )+
+    # pre-defined plot theme
+    plotTheme1
+
+# Save plot
+ggsave(Correlation.plot2, file = paste0("St_leafout_correlation_density.pdf"),
+       path = output.dir, width = 10.5, height = 6)
+
+print(Correlation.plot2)
+```
+
+</details>
+
+<br>
+
+# 3. Reproducibility
+
+<details>
+
+<summary>show</summary>
+
+```{r}
+# Datetime
+Sys.time()
+
+# Session info
+sessionInfo()
+```
+
+</details>

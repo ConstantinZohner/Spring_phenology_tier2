@@ -1,0 +1,921 @@
+#####################
+# Required packages #
+#####################
+
+
+
+require(data.table)
+require(dplyr)
+require(parallel)
+require(zoo)
+
+
+# cd /nfs/nas22.ethz.ch/fs2201/usys_ibz_cr_lab/Constantin/Spring_phenology_tier2/Full_analysis
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+################
+# Define Paths #
+################
+
+
+
+# 1. Input
+##########
+
+Input_path = "Input"
+EOBS_path  = "Input/EOBS_data"
+
+
+# 2. Output
+###########
+
+Output_path1 = "Output/Individual_files"
+Output_path2 = "Output/Merged_file"
+Output_path3 = "Output/Missing_observations"
+Output_path4 = "Output"
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+#################
+## Import data ##
+#################
+
+
+
+## Phenology data
+#################
+
+PEP.df <- fread(paste(Input_path, "PEP725_data_clean.csv", sep="/")) 
+
+
+## Photoperiod
+##############
+
+photo.df = fread(paste(Input_path, "Photoperiod.csv", sep="/"))
+
+
+## Import daily climatic datasets from GLDAS
+############################################
+
+#define climate variables
+list.files(EOBS_path)
+vn <- c("tg_ens_mean_0.1deg_reg_v30.0e.csv", # daily mean temperature 
+        "tn_ens_mean_0.1deg_reg_v30.0e.csv", # daily minimum temperature
+        "tx_ens_mean_0.1deg_reg_v30.0e.csv", # daily maximum temperature
+        "rr_ens_mean_0.1deg_reg_v30.0e.csv", # daily precipitation sum 
+        "hu_ens_mean_0.1deg_reg_v30.0e.csv", # daily mean relative humidity 
+        "qq_ens_mean_0.1deg_reg_v29.0e.csv") # global radiation
+# not used: 
+# "pp_ens_mean_0.1deg_reg_v30.0e.csv" daily mean sea level pressure 
+
+#create empty list
+DataList <- replicate(length(vn),data.frame())
+#loop through climate variables
+for(i in 1:length(vn)) {
+  #read data
+  data = fread(paste0(EOBS_path, "/", vn[i]))
+  #add table to list
+  DataList[[i]] = data }
+#add names to list
+names(DataList)=vn
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+######################
+## Helper functions ##
+######################
+
+
+
+################################
+# Chilling and GDD calculation #
+################################
+
+
+# Chilling units
+Chill.fun = function(Temp, threshold_low, threshold_up){
+  if(between(Temp,threshold_low, threshold_up)) {CU=1} else {CU=0}
+  return(CU)
+}
+
+# Forcing units
+GDD.fun = function(Temp, threshold_low){
+  if(Temp >= threshold_low) {GDD=Temp-threshold_low} else {GDD=0}
+  return(GDD)
+}
+
+
+#####################
+# Photoperiod model #
+#####################
+
+
+# Function for photoperiod sensitivity with different k and p values
+photoperiod_response <- function(DL, k, p) {
+  DL_adjusted <- pmax(DL - 6, 0)  # Shift DL so that it starts at 6 hours instead of 0
+  f_DL <- (log(1 + k * DL_adjusted) / log(1 + k * (20 - 6)))^p  # Normalize to DL = 20
+  f_DL <- pmin(f_DL, 1)  # Cap at 1 from DL = 20 to 24
+  return(f_DL)
+}
+
+
+##################
+# Chilling model #
+##################
+
+
+# Function for chilling dependency scaling factor
+chilling_response <- function(Chilling, requirement) {
+  factor <- pmin(Chilling / requirement, 1)  # chilling dependency reaches 1 at X chill days
+  return(factor)
+}
+# Chilling = actual chilling unit 
+# requirement = total chilling requirement (in days), i.e., after how many chill days is chilling completely fulfilled?
+
+
+#####################################
+# Function to compute adjusted GDDs #
+#####################################
+
+
+adjust_gdd <- function(GDD, Chilling, requirement=150, include_photo = F, DL = NULL, k = 1, p = 1) {
+  f_Chill <- chilling_response(Chilling, requirement)
+  
+  if (include_photo) {
+    if (is.null(DL)) stop("DL must be provided when include_photo is TRUE")
+    f_Photo <- photoperiod_response(DL, k, p)
+    GDD_adjusted <- GDD * f_Chill * f_Photo
+  } else {
+    GDD_adjusted <- GDD * f_Chill
+  }
+  
+  return(GDD_adjusted)
+}
+
+
+#################################
+# Replace NA with neighbor mean #
+#################################
+
+
+replace_na_with_neighbor_mean <- function(x) {
+  if (!is.numeric(x)) return(x)  # Ensure only numeric columns are processed
+  
+  na_indices <- which(is.na(x))  # Identify NA indices
+  known_indices <- which(!is.na(x))  # Identify non-NA values
+  
+  if (length(known_indices) == 0) {
+    return(x)  # If all values are NA, return as is
+  }
+  
+  for (i in na_indices) {
+    # Find nearest non-NA before and after
+    before_idx <- ifelse(any(known_indices < i), max(known_indices[known_indices < i]), NA)
+    after_idx <- ifelse(any(known_indices > i), min(known_indices[known_indices > i]), NA)
+    
+    if (!is.na(before_idx) & !is.na(after_idx)) {
+      # Compute mean of the surrounding values
+      x[i] <- mean(c(x[before_idx], x[after_idx]), na.rm = TRUE)
+    } else if (!is.na(before_idx)) {
+      x[i] <- x[before_idx]  # If NA is at the end, take the previous value
+    } else if (!is.na(after_idx)) {
+      x[i] <- x[after_idx]  # If NA is at the beginning, take the next value
+    }
+  }
+  
+  return(x)
+}
+
+
+############################################
+# Stacking of hourly temperatures (chillR) #
+############################################
+
+
+stack_hourly_temps = function (weather = NULL, latitude = 50, hour_file = NULL, keep_sunrise_sunset = FALSE) 
+{
+  if (length(latitude) > 1) 
+    stop("'latitude' has more than one element")
+  if (!is.numeric(latitude)) 
+    stop("'latitude' is not numeric")
+  if (latitude > 90 | latitude < (-90)) 
+    warning("'latitude' is usually between -90 and 90")
+  if (is.null(weather) & (!is.null(hour_file))) 
+    weather <- hour_file
+  if ((length(names(weather)) == 2) & ("weather" %in% names(weather)) & 
+      ("QC" %in% names(weather))) {
+    if (!keep_sunrise_sunset) 
+      THourly <- make_hourly_temps(latitude, weather$weather)
+    if (keep_sunrise_sunset) 
+      THourly <- make_hourly_temps(latitude, weather$weather, 
+                                   keep_sunrise_sunset = TRUE)
+    QC <- weather$QC
+  }
+  if ((length(names(weather)) > 24) & ("Hour_23" %in% names(weather))) {
+    THourly <- weather
+    QC <- NA
+  }
+  if ((length(names(weather)) > 2) & ("Tmax" %in% names(weather))) {
+    if (!keep_sunrise_sunset) 
+      THourly <- make_hourly_temps(latitude, weather)
+    if (keep_sunrise_sunset) 
+      THourly <- make_hourly_temps(latitude, weather, keep_sunrise_sunset = TRUE)
+    QC <- NA
+  }
+  if (is.null(weather) & is.null(hour_file)) {
+    tt = NA
+    QC = NA
+  }
+  else {
+    preserve_columns <- colnames(THourly)[1:(ncol(THourly) - 
+                                               24)]
+    THourly[, "index"] <- row(THourly)[, 1]
+    ss <- stack(THourly, select = c(paste("Hour_", 0:23, 
+                                          sep = "")))
+    colnames(ss) <- c("Temp", "Hour")
+    ss$Hour <- as.numeric(sapply(strsplit(as.character(ss$Hour), 
+                                          "_"), "[", 2))
+    for (pc in preserve_columns) {
+      ss[, pc] <- rep(THourly[, pc], 24)
+    }
+    tt <- ss[with(ss, order(Year, JDay, Hour)), ]
+    tt <- tt[c(preserve_columns, "Hour", "Temp")]
+  }
+  return(list(hourtemps = tt, QC = QC))
+}
+
+
+#####################################
+# Make hourly temperatures (chillR) #
+#####################################
+
+
+make_hourly_temps = function (latitude, year_file, keep_sunrise_sunset = FALSE) 
+{
+  if (missing(latitude)) 
+    stop("'latitude' not specified")
+  if (length(latitude) > 1) 
+    stop("'latitude' has more than one element")
+  if (!is.numeric(latitude)) 
+    stop("'latitude' is not numeric")
+  if (latitude > 90 | latitude < (-90)) 
+    warning("'latitude' is usually between -90 and 90")
+  year_file <- year_file[which(!is.na(year_file$Tmin) & !is.na(year_file$Tmax)), 
+  ]
+  if (!"JDay" %in% colnames(year_file)) 
+    year_file[, "JDay"] <- strptime(paste(year_file$Month, 
+                                          "/", year_file$Day, "/", year_file$Year, sep = ""), 
+                                    "%m/%d/%Y")$yday + 1
+  preserve_columns <- colnames(year_file)
+  Day_times <- daylength(latitude = latitude, JDay = c(year_file$JDay[1] - 
+                                                         1, year_file$JDay, year_file$JDay[nrow(year_file)] + 
+                                                         1))
+  Day_times$Sunrise[which(Day_times$Sunrise == 99)] <- 0
+  Day_times$Sunrise[which(Day_times$Sunrise == -99)] <- 12
+  Day_times$Sunset[which(Day_times$Sunset == 99)] <- 24
+  Day_times$Sunset[which(Day_times$Sunset == -99)] <- 12
+  year_file$Sunrise <- Day_times$Sunrise[2:(length(Day_times$Sunrise) - 
+                                              1)]
+  year_file$Sunset <- Day_times$Sunset[2:(length(Day_times$Sunset) - 
+                                            1)]
+  year_file$Daylength <- Day_times$Daylength[2:(length(Day_times$Daylength) - 
+                                                  1)]
+  year_file$prev_Sunset <- Day_times$Sunset[1:(length(Day_times$Sunset) - 
+                                                 2)]
+  year_file$next_Sunrise <- Day_times$Sunrise[3:length(Day_times$Sunrise)]
+  year_file$prev_max <- year_file$Tmax[c(NA, 1:(nrow(year_file) - 
+                                                  1))]
+  year_file$next_min <- year_file$Tmin[c(2:nrow(year_file), 
+                                         NA)]
+  year_file$prev_min <- year_file$Tmin[c(NA, 1:(nrow(year_file) - 
+                                                  1))]
+  year_file$Tsunset <- year_file$Tmin + (year_file$Tmax - year_file$Tmin) * 
+    sin((pi * (year_file$Sunset - year_file$Sunrise)/(year_file$Daylength + 
+                                                        4)))
+  year_file$prev_Tsunset <- year_file$prev_min + (year_file$prev_max - 
+                                                    year_file$prev_min) * sin((pi * (year_file$Daylength)/(year_file$Daylength + 
+                                                                                                             4)))
+  colnum <- ncol(year_file) + 1
+  hourcol <- c(colnum:(colnum + 23))
+  for (hour in 0:23) {
+    hourcount <- hour + 1
+    no_riseset <- which(year_file$Daylength %in% c(0, 24, 
+                                                   -99))
+    year_file[no_riseset, colnum + hour] <- ((year_file$Tmax + 
+                                                year_file$Tmin)/2)[no_riseset]
+    c_morn <- which(hour <= year_file$Sunrise)
+    if (1 %in% c_morn) 
+      if (!length(c_morn) == 1) 
+        c_morn <- c_morn[2:length(c_morn)]
+    else c_morn <- c()
+    c_day <- which(hour > year_file$Sunrise & hour <= year_file$Sunset)
+    c_eve <- which(hour >= year_file$Sunset)
+    if (nrow(year_file) %in% c_eve) 
+      c_eve <- c_eve[1:(length(c_eve) - 1)]
+    year_file[c_morn, colnum + hour] <- year_file$prev_Tsunset[c_morn] - 
+      ((year_file$prev_Tsunset[c_morn] - year_file$Tmin[c_morn])/log(pmax(1, 
+                                                                          24 - (year_file$prev_Sunset[c_morn] - year_file$Sunrise[c_morn]))) * 
+         log(hour + 24 - year_file$prev_Sunset[c_morn] + 
+               1))
+    year_file[c_day, colnum + hour] <- year_file$Tmin[c_day] + 
+      (year_file$Tmax[c_day] - year_file$Tmin[c_day]) * 
+      sin((pi * (hour - year_file$Sunrise[c_day])/(year_file$Daylength[c_day] + 
+                                                     4)))
+    year_file[c_eve, colnum + hour] <- year_file$Tsunset[c_eve] - 
+      ((year_file$Tsunset[c_eve] - year_file$next_min[c_eve])/log(24 - 
+                                                                    (year_file$Sunset[c_eve] - year_file$next_Sunrise[c_eve]) + 
+                                                                    1) * log(hour - year_file$Sunset[c_eve] + 1))
+  }
+  colnames(year_file)[(ncol(year_file) - 23):(ncol(year_file))] <- c(paste("Hour_", 
+                                                                           0:23, sep = ""))
+  if (!keep_sunrise_sunset) 
+    year_file <- year_file[, c(preserve_columns, paste("Hour_", 
+                                                       0:23, sep = ""))]
+  if (keep_sunrise_sunset) 
+    year_file <- year_file[, c(preserve_columns, "Sunrise", 
+                               "Sunset", "Daylength", paste("Hour_", 0:23, sep = ""))]
+  year_file[1, (ncol(year_file) - 23):(ncol(year_file))][which(is.na(year_file[1, 
+                                                                               (ncol(year_file) - 23):(ncol(year_file))]))] <- year_file[1, 
+                                                                                                                                         "Tmin"]
+  year_file[nrow(year_file), (ncol(year_file) - 23):(ncol(year_file))][which(is.na(year_file[nrow(year_file), 
+                                                                                             (ncol(year_file) - 23):(ncol(year_file))]))] <- year_file[nrow(year_file), 
+                                                                                                                                                       "Tmin"]
+  return(year_file)
+}
+
+
+############################################################
+# Compute sunrise and sunset times, and daylength (chillR) #
+############################################################
+
+
+daylength = function (latitude, JDay, notimes.as.na = FALSE) 
+{
+  if (missing(latitude)) 
+    stop("'latitude' not specified")
+  if (missing(JDay)) 
+    stop("'JDay' not specified")
+  if (!isTRUE(all(is.numeric(JDay)))) 
+    stop("'JDay' contains non-numeric values")
+  if (length(latitude) > 1) 
+    stop("'latitude' has more than one element")
+  if (!is.numeric(latitude)) 
+    stop("'latitude' is not numeric")
+  if (latitude > 90 | latitude < (-90)) 
+    warning("'latitude' is usually between -90 and 90")
+  Gamma <- 2 * pi/365 * ((JDay) - 1)
+  Delta <- 180/pi * (0.006918 - 0.399912 * cos(Gamma) + 0.070257 * 
+                       sin(Gamma) - 0.006758 * cos(2 * Gamma) + 0.000907 * sin(2 * 
+                                                                                 (Gamma)) - 0.002697 * cos(3 * (Gamma)) + 0.00148 * sin(3 * 
+                                                                                                                                          (Gamma)))
+  CosWo <- (sin(-0.8333/360 * 2 * pi) - sin(latitude/360 * 
+                                              2 * pi) * sin(Delta/360 * 2 * pi))/(cos(latitude/360 * 
+                                                                                        2 * pi) * cos(Delta/360 * 2 * pi))
+  normal_days <- which(CosWo >= -1 & CosWo <= 1)
+  Sunrise <- rep(-99, length(CosWo))
+  Sunrise[normal_days] <- 12 - acos(CosWo[normal_days])/(15/360 * 
+                                                           2 * pi)
+  Sunset <- rep(-99, length(CosWo))
+  Sunset[normal_days] <- 12 + acos(CosWo[normal_days])/(15/360 * 
+                                                          2 * pi)
+  Daylength <- Sunset - Sunrise
+  Daylength[which(CosWo > 1)] <- 0
+  Daylength[which(CosWo < (-1))] <- 24
+  Sunrise[which(Daylength == 24)] <- 99
+  Sunset[which(Daylength == 24)] <- 99
+  if (notimes.as.na) {
+    Sunrise[which(Sunrise %in% c(-99, 99))] <- NA
+    Sunset[which(Sunset %in% c(-99, 99))] <- NA
+  }
+  Sunset[which(is.na(JDay))] <- NA
+  Sunrise[which(is.na(JDay))] <- NA
+  Daylength[which(is.na(JDay))] <- NA
+  return(list(Sunrise = Sunrise, Sunset = Sunset, Daylength = Daylength))
+}
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+##############################
+## Merge datasets into list ##
+##############################
+
+
+
+# Identifier 1 (all site x year combinations)
+PEP.df$site_year = paste0(PEP.df$s_id,"_",PEP.df$year)
+
+# Identifier 2 (all timeseries x year combinations)
+PEP.df$ts_yr     = paste0(PEP.df$timeseries,"_",PEP.df$year)
+timeseries_year  = unique(PEP.df$ts_yr)
+
+# add PEP data (+plant functional type label) and photoperiod to list
+DataList[[7]] = photo.df
+DataList[[8]] = PEP.df
+
+rm(photo.df, data, PEP.df)
+names(DataList)=c(vn,"photoperiod","PEP")
+names(DataList)
+
+
+
+
+#############################################################
+## Loop through each observations using parallel computing ##
+#############################################################
+
+
+
+parallelCalc <- function(timeseries_years){ 
+  
+  # Subset input data by time-point
+  #################################
+  
+  #phenology data
+  pheno.sub  <- DataList[[8]][which(DataList[[8]]$ts_yr==timeseries_years),]
+  
+  # Define the length of the period of interest in calendar units
+  year1     <- as.character(pheno.sub$year-1)
+  year2     <- as.character(pheno.sub$year)
+  start_doy <- paste(year1,"-01-01", sep="") 
+  end_doy   <- paste(year2,"-06-30", sep="")
+  days      <- seq(as.Date(start_doy), as.Date(end_doy), by="days")
+  
+  #get number of days in year 1 and year 2
+  days_year1 <- length(seq(as.Date(start_doy), as.Date(paste(year1,"-12-31", sep="")), by="days"))
+  days_year2 <- length(seq(as.Date(paste0(year2,"-01-01")), as.Date(end_doy), by="days"))
+  
+  
+  # ------------------------------------------------------------------------
+  # Short Name        ; Long Name                               ; Unit [d-1]
+  # ------------------------------------------------------------------------
+  # SWRAD             ; Surface shortwave downwelling radiation ; W m-2
+  # PRCP              ; Precipitation rate                      ; mm d-1
+  # RH                ; Relative humidity                       ; %
+  # TMIN              ; Minimum Air Temperature                 ; degC
+  # TMEAN             ; Mean Air Temperature                    ; degC
+  # TMAX              ; Maximum Air Temperature                 ; degC
+  # ------------------------------------------------------------------------
+  
+  
+  #Tmean
+  T_mean.sub2 <- DataList[[1]][which(DataList[[1]]$site_year==pheno.sub$site_year),]%>%
+    dplyr::select(as.character(1:days_year2))
+  
+  #--------------------------------------
+  #Skip timeseries for which there is: 
+  if (
+    # 1) no climate data for current year and/or
+    nrow(T_mean.sub2)==0 |
+    # 2) no climate data for previous year
+    nrow(DataList[[1]][which(DataList[[1]]$s_id==pheno.sub$s_id & DataList[[1]]$year==year1),])==0
+  ) {
+    # safe table
+    write.table(pheno.sub, file=paste0(Output_path3, '/', timeseries_years, '.csv'), 
+                sep=',', row.names = F, col.names = T)
+  } else {
+    #--------------------------------------
+    
+    T_mean.sub1 <- DataList[[1]][which(DataList[[1]]$s_id==pheno.sub$s_id & DataList[[1]]$year==year1),]%>% 
+      dplyr::select(as.character(1:days_year1))
+    T_mean.sub  <- cbind(T_mean.sub1, T_mean.sub2)
+    
+    #Tmin
+    T_min.sub1 <- DataList[[2]][which(DataList[[2]]$s_id==pheno.sub$s_id & DataList[[2]]$year==year1),]%>% 
+      dplyr::select(as.character(1:days_year1))
+    T_min.sub2 <- DataList[[2]][which(DataList[[2]]$site_year==pheno.sub$site_year),]%>%
+      dplyr::select(as.character(1:days_year2))
+    T_min.sub  <- cbind(T_min.sub1, T_min.sub2)
+    
+    #Tmax
+    T_max.sub1 <- DataList[[3]][which(DataList[[3]]$s_id==pheno.sub$s_id & DataList[[3]]$year==year1),]%>% 
+      dplyr::select(as.character(1:days_year1))
+    T_max.sub2 <- DataList[[3]][which(DataList[[3]]$site_year==pheno.sub$site_year),]%>%
+      dplyr::select(as.character(1:days_year2))
+    T_max.sub  <- cbind(T_max.sub1, T_max.sub2)
+    
+    #Prcp
+    prcp.sub1 <- DataList[[4]][which(DataList[[4]]$s_id==pheno.sub$s_id & DataList[[4]]$year==year1),]%>% 
+      dplyr::select(as.character(1:days_year1))
+    prcp.sub2 <- DataList[[4]][which(DataList[[4]]$site_year==pheno.sub$site_year),]%>%
+      dplyr::select(as.character(1:days_year2))
+    prcp.sub  <- cbind(prcp.sub1, prcp.sub2)
+    
+    #Qair
+    rh.sub1 <- DataList[[5]][which(DataList[[5]]$s_id==pheno.sub$s_id & DataList[[5]]$year==year1),]%>% 
+      dplyr::select(as.character(1:days_year1))
+    rh.sub2 <- DataList[[5]][which(DataList[[5]]$site_year==pheno.sub$site_year),]%>%
+      dplyr::select(as.character(1:days_year2))
+    rh.sub  <- cbind(rh.sub1, rh.sub2)
+    
+    #SWrad
+    swrad.sub1 <- DataList[[6]][which(DataList[[6]]$s_id==pheno.sub$s_id & DataList[[6]]$year==year1),]%>% 
+      dplyr::select(as.character(1:days_year1))
+    swrad.sub2 <- DataList[[6]][which(DataList[[6]]$site_year==pheno.sub$site_year),]%>%
+      dplyr::select(as.character(1:days_year2))
+    swrad.sub  <- cbind(swrad.sub1, swrad.sub2)
+    
+    #Photo
+    photo.sub1 <- DataList[[7]][which(DataList[[7]]$lat==pheno.sub$lat),][1]%>% 
+      dplyr::select(as.character(1:days_year1))
+    photo.sub2 <- DataList[[7]][which(DataList[[7]]$lat==pheno.sub$lat),][1]%>%
+      dplyr::select(as.character(1:days_year2))
+    photo.sub  <- cbind(photo.sub1, photo.sub2)
+    
+    
+    ##############################################################################################################################################
+    
+    
+    ###############################
+    # Create table of daily climate
+    ###############################
+    
+    
+    # Generate sub-dataframe to store results
+    factors.sub <- pheno.sub %>% 
+      dplyr::select(s_id,species,timeseries,year,lat,lon,alt,alt_dem,
+                    leaf_out,leaf_out_prev,leaf_out_mean,leaf_out_sd,leaf_off,n.years,n.years.reduced)
+    factors.sub = as.data.frame(factors.sub) 
+    
+    #create table
+    daily_vals <- data.frame(Year     = lubridate::year(as.Date(days,origin=days[1])),
+                             Month    = lubridate::month(as.Date(days,origin=days[1])),
+                             Day      = lubridate::day(as.Date(days,origin=days[1])),
+                             DOY      = as.numeric(names(T_mean.sub)),
+                             Tmin     = as.numeric(T_min.sub), 
+                             Tmean    = as.numeric(T_mean.sub), 
+                             Tmax     = as.numeric(T_max.sub), 
+                             SWrad    = as.numeric(swrad.sub),
+                             Prcp     = as.numeric(prcp.sub), 
+                             RH       = as.numeric(rh.sub),
+                             DL       = as.numeric(photo.sub)) %>% 
+      #replace NAs with neighbor mean
+      mutate(across(c(Tmin, Tmean, Tmax, SWrad, Prcp, RH, DL), replace_na_with_neighbor_mean))
+    
+    
+    ##############################################################################################################################################
+    
+    
+    ######################
+    # Add chilling and GDD
+    ######################
+    
+    
+    # Get hourly values
+    hourly_vals = stack_hourly_temps(daily_vals, latitude=pheno.sub$lat)$hourtemps
+    
+    # Chilling and Forcing hours
+    Chill_days = hourly_vals %>%
+      #add Chilling and Forcing units
+      mutate(Chill = sapply(Temp, Chill.fun, threshold_low=-10, threshold_up=10),
+             GDD   = sapply(Temp, GDD.fun,   threshold_low=5)) %>%
+      #summarise hourly to daily values
+      group_by(Year, Month, Day) %>%
+      summarise(Chill = mean(Chill, na.rm=T),
+                GDD   = mean(GDD, na.rm=T))%>%
+      ungroup() %>%
+      #order
+      dplyr::select(Chill, GDD) 
+    
+    # define November first as start date of chilling accumulation
+    start_row <-  which(daily_vals$Month==11 & daily_vals$Day==1)  
+    
+    # Cbind
+    daily_vals = cbind(daily_vals, Chill_days) %>%
+      mutate(
+        #continous count from Jan 1
+        id = row_number(),
+        # Sum chilling days from 1 November
+        Chill_sum = ifelse(id < start_row, 0, cumsum(ifelse(id >= start_row, Chill, 0))),
+        # Add chilling/photoperiod-adjusted GDDs
+        GDD.chill.lo = adjust_gdd(GDD=GDD, Chilling=Chill_sum, requirement=75),
+        GDD.chill.hi = adjust_gdd(GDD=GDD, Chilling=Chill_sum, requirement=150),
+        GDD.chill.DL = adjust_gdd(GDD=GDD, Chilling=Chill_sum, requirement=150, include_photo = T, DL = DL)) %>% 
+      #order
+      dplyr::select(id, Year, Month, Day, DOY, Tmin, Tmean, Tmax, everything()) 
+    
+    
+    ##############################################################################################################################################
+    
+    
+    #####################
+    # Get important dates
+    #####################
+    
+    
+    #row of leaf-out date
+    DOY_out      = which(daily_vals$DOY==pheno.sub$leaf_out & daily_vals$Year==year2)   
+    
+    #leaf-out date of the previous year
+    DOY_out_prev = pheno.sub$leaf_out_prev
+    
+    #row of mean leaf-out date
+    DOY_out_mean = which(daily_vals$DOY==pheno.sub$leaf_out_mean & daily_vals$Year==year2)   
+    
+    #longest day of year
+    solstice1    = which(daily_vals$DL==max(daily_vals$DL))[1] 
+    
+    #shortest day of year
+    solstice2    = which(daily_vals$DL==min(daily_vals$DL))[1] 
+    
+    #March equinox previous year
+    equinox1     = solstice1 - 93       
+    
+    #September equinox
+    equinox2     = solstice2 - 90      
+    
+    #March equinox
+    equinox3     = solstice2 + 89                                    
+    
+    #May 1
+    May1         = which(daily_vals$Day==1 & daily_vals$Month==5 & daily_vals$Year==year1)
+    
+    #Sep 30
+    Sep30        = which(daily_vals$Day==30 & daily_vals$Month==9 & daily_vals$Year==year1)      
+    
+    #Jul 15
+    Jul15        = which(daily_vals$Day==15 & daily_vals$Month==7 & daily_vals$Year==year1)      
+    
+    
+    ##############################################################################################################################################
+    
+    
+    ####################################
+    # Late spring frost in previous year
+    ####################################
+    
+    
+    # was there a frost event below -2°C from leaf-out until July 15?
+    factors.sub$LSF2 = ifelse(any(daily_vals$Tmin[DOY_out_prev:Jul15] < -2, na.rm=T), 1, 0)
+    
+    # was there a frost event below -4°C from leaf-out until July 15?
+    factors.sub$LSF4 = ifelse(any(daily_vals$Tmin[DOY_out_prev:Jul15] < -4, na.rm=T), 1, 0)
+    
+    
+    ##############################################################################################################################################
+    
+    
+    #######################################
+    # Get drivers before and after solstice
+    #######################################
+    
+    
+    #clean daily data table
+    daily_vals = daily_vals %>%
+      dplyr::select(-c(DL, Chill_sum))
+    
+    #define variables
+    variable.names = c("Tmin","Tmean","Tmax","SWrad","Prcp","RH","Chill")
+    
+    for(i in 1:length(variable.names)) {
+      
+      #choose variable (daily values)
+      variable = daily_vals[,variable.names[i]]
+      
+      # Name variables
+      ################
+      
+      # Seasonal
+      ##########
+      
+      # EQ1...March equinox previous year
+      # SO1...Summer solstice (~22 June)
+      # EQ2...September equinox previous year
+      # SO2...Winter solstice (~22 Dec)
+      # EQ3...March equinox
+      # LO...leaf-out date
+      # GS...period from May 1 to September 30
+      
+      varname.GS          <- paste(variable.names[i], "GS",    sep=".")
+      
+      varname.EQ1.SO1     <- paste(variable.names[i], "EQ1.SO1",    sep=".")
+      varname.EQ1.EQ2     <- paste(variable.names[i], "EQ1.EQ2",    sep=".")
+      varname.EQ1.SO2     <- paste(variable.names[i], "EQ1.SO2",    sep=".")
+      varname.EQ1.EQ3     <- paste(variable.names[i], "EQ1.EQ3",    sep=".")
+      varname.EQ1.LO      <- paste(variable.names[i], "EQ1.LO",     sep=".")
+      
+      varname.SO1.EQ2     <- paste(variable.names[i], "SO1.EQ2",    sep=".")
+      varname.SO1.SO2     <- paste(variable.names[i], "SO1.SO2",    sep=".")
+      varname.SO1.EQ3     <- paste(variable.names[i], "SO1.EQ3",    sep=".")
+      varname.SO1.LO      <- paste(variable.names[i], "SO1.LO",     sep=".")
+      
+      varname.EQ2.SO2     <- paste(variable.names[i], "EQ2.SO2",    sep=".")
+      varname.EQ2.EQ3     <- paste(variable.names[i], "EQ2.EQ3",    sep=".")
+      varname.EQ2.LO      <- paste(variable.names[i], "EQ2.LO",     sep=".")
+      varname.EQ2.LOsum   <- paste(variable.names[i], "EQ2.LOsum",  sep=".")
+      
+      varname.SO2.EQ3     <- paste(variable.names[i], "SO2.EQ3",    sep=".")
+      varname.SO2.LO      <- paste(variable.names[i], "SO2.LO",     sep=".")
+      
+      varname.LO.SO1      <- paste(variable.names[i], "LO.SO1",    sep=".")
+      varname.LO.EQ2      <- paste(variable.names[i], "LO.EQ2",    sep=".")
+      varname.LO.SO2      <- paste(variable.names[i], "LO.SO2",    sep=".")
+      varname.LO.EQ3      <- paste(variable.names[i], "LO.EQ3",    sep=".")
+      varname.LO.LO       <- paste(variable.names[i], "LO.LO",     sep=".")
+      
+      # Solstice
+      ##########
+      
+      # solstice1...sum of 40 to 10 days before solstice
+      # solstice2...sum of 30 to 0 days before solstice
+      # solstice3...sum of 20 days before to 10 days after solstice
+      # solstice4...sum of 10 days before to 20 days after solstice
+      # solstice5...sum of 0 to 30 days after solstice
+      # solstice6...sum of 10 to 40 days after solstice
+      varname.solstice1   <- paste(variable.names[i], "solstice1", sep=".")
+      varname.solstice2   <- paste(variable.names[i], "solstice2", sep=".")
+      varname.solstice3   <- paste(variable.names[i], "solstice3", sep=".")
+      varname.solstice4   <- paste(variable.names[i], "solstice4", sep=".")
+      varname.solstice5   <- paste(variable.names[i], "solstice5", sep=".")
+      varname.solstice6   <- paste(variable.names[i], "solstice6", sep=".")
+      
+      
+      # Extract drivers
+      #################
+      
+      factors.sub = factors.sub %>%
+        mutate(
+          #seasonal
+          !!varname.GS          := mean(variable[May1:Sep30]),
+          
+          !!varname.EQ1.SO1     := mean(variable[equinox1:solstice1]),
+          !!varname.EQ1.EQ2     := mean(variable[equinox1:equinox2]),
+          !!varname.EQ1.SO2     := mean(variable[equinox1:solstice2]),
+          !!varname.EQ1.EQ3     := mean(variable[equinox1:equinox3]),
+          !!varname.EQ1.LO      := mean(variable[equinox1:DOY_out_mean]),
+          
+          !!varname.SO1.EQ2     := mean(variable[solstice1:equinox2]),
+          !!varname.SO1.SO2     := mean(variable[solstice1:solstice2]),
+          !!varname.SO1.EQ3     := mean(variable[solstice1:equinox3]),
+          !!varname.SO1.EQ2     := mean(variable[solstice1:equinox2]),
+          !!varname.SO1.LO      := mean(variable[solstice1:DOY_out_mean]),
+          
+          !!varname.EQ2.SO2     := mean(variable[equinox2:solstice2]),
+          !!varname.EQ2.EQ3     := mean(variable[equinox2:equinox3]),
+          !!varname.EQ2.LO      := mean(variable[equinox2:DOY_out_mean]),
+          !!varname.EQ2.LOsum   := sum(variable[equinox2:DOY_out_mean]),
+          
+          !!varname.SO2.EQ3     := mean(variable[solstice2:equinox3]),
+          !!varname.SO2.LO      := mean(variable[solstice2:DOY_out_mean]),
+          
+          !!varname.LO.SO1      := sum(variable[DOY_out_prev:solstice1]),
+          !!varname.LO.EQ2      := sum(variable[DOY_out_prev:equinox2]),
+          !!varname.LO.SO2      := sum(variable[DOY_out_prev:solstice2]),
+          !!varname.LO.EQ3      := sum(variable[DOY_out_prev:equinox3]),
+          !!varname.LO.LO       := sum(variable[DOY_out_prev:DOY_out_mean]),
+          
+          #solstice
+          !!varname.solstice1   := mean(variable[(solstice2-39):(solstice2-10)]),
+          !!varname.solstice2   := mean(variable[(solstice2-29):solstice2]),
+          !!varname.solstice3   := mean(variable[(solstice2-19):(solstice2+10)]),
+          !!varname.solstice4   := mean(variable[(solstice2-9):(solstice2+20)]),
+          !!varname.solstice5   := mean(variable[(solstice2+1):(solstice2+30)]),
+          !!varname.solstice6   := mean(variable[(solstice2+11):(solstice2+40)]) )
+    }
+    
+    
+    ##############################################################################################################################################
+    
+    
+    #######################################################
+    # Add accumulated GDDs from winter solstice to leaf-out
+    #######################################################
+    
+    
+    factors.sub = factors.sub %>%
+      mutate(
+        GDD          = sum(daily_vals$GDD[solstice2:DOY_out]),
+        GDD.chill.lo = sum(daily_vals$GDD.chill.lo[solstice2:DOY_out]),
+        GDD.chill.hi = sum(daily_vals$GDD.chill.hi[solstice2:DOY_out]),
+        GDD.chill.DL = sum(daily_vals$GDD.chill.DL[solstice2:DOY_out]))
+    
+    
+    ##############################################################################################################################################
+    
+    
+    ################################
+    # Calculate the monthly averages
+    ################################
+    
+    
+    #get means and sums
+    variable.names = c("Tmin", "Tmean", "Tmax", "SWrad", "RH")
+    monthly_means  = data.frame(daily_vals %>% 
+                                  group_by(Year,Month) %>% 
+                                  summarize_at(variable.names, mean, na.rm = TRUE))
+    
+    #Transform data
+    monthly_means = as.data.frame(t(monthly_means))
+    
+    #Add to table
+    #############
+    
+    #loop through variables
+    for(i in 1:length(variable.names)) {
+      #select  variable
+      MONTHLY.DF = monthly_means[variable.names[i],]
+      #add column names
+      names(MONTHLY.DF)=paste0(row.names(MONTHLY.DF), '.', c(1:18))
+      #cbind with table
+      factors.sub = cbind(factors.sub, MONTHLY.DF)
+    }
+    
+    
+    ##############################################################################################################################################
+    
+    
+    ############################
+    # Get preseason temperatures
+    ############################
+    
+    
+    ## Calculate the average preseason temperatures (15 to 120 days prior to mean leaf-out date)
+    
+    #get preseason length vector (10 to 120 days with 10-day steps)
+    preseason.lengths = seq(10, 120, 10)
+    
+    #loop through preseasons
+    for(preseason.length in preseason.lengths) {
+      #name columns
+      preseason.Tmean  <- paste0("Tmean.PS",  preseason.length)
+      preseason.Tmax   <- paste0("Tmax.PS",   preseason.length)
+      preseason.Tmin   <- paste0("Tmin.PS",   preseason.length)
+      preseason.SWrad  <- paste0("SWrad.PS",  preseason.length)
+      preseason.RH     <- paste0("RH.PS",     preseason.length)
+      #add columns to table
+      factors.sub = factors.sub %>%
+        mutate(!!preseason.Tmean   := mean(daily_vals$Tmean[(DOY_out_mean-preseason.length):DOY_out_mean]),
+               !!preseason.Tmax    := mean(daily_vals$Tmax[(DOY_out_mean-preseason.length):DOY_out_mean]),
+               !!preseason.Tmin    := mean(daily_vals$Tmin[(DOY_out_mean-preseason.length):DOY_out_mean]),
+               !!preseason.SWrad   := mean(daily_vals$SWrad[(DOY_out_mean-preseason.length):DOY_out_mean]),
+               !!preseason.RH      := mean(daily_vals$RH[(DOY_out_mean-preseason.length):DOY_out_mean]) )
+    }
+    
+    
+    ##############################################################################################################################################
+    
+    
+    # Safe the table   
+    write.table(factors.sub, file=paste0(Output_path1, '/', timeseries_years, '.csv'), sep=',', row.names =F, col.names = T)
+    
+  }
+}
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+#initialize the loop
+outputlist = mclapply(timeseries_year, parallelCalc, mc.cores=48, mc.preschedule=T)
+
+#safe number of files
+length.df=data.frame(n.files=length(list.files(path=Output_path1, pattern='.csv')) )
+write.table(length.df, file=paste0(Output_path4, '/n.files.csv'), sep=',', row.names =F, col.names = T)
+
+#Rbind files
+climate.factors.df = rbindlist(lapply(list.files(path = Output_path1), 
+                                         function(n) fread(file.path(Output_path1, n))))
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+###################
+## Safe the data ##
+###################
+
+
+
+#Safe table
+write.csv(climate.factors.df, paste(Output_path2, "pep_drivers_spring_data.csv", sep="/"))
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+

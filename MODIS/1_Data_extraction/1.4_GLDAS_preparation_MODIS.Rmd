@@ -1,0 +1,233 @@
+---
+title: Spring phenology tier2 project
+author: Constantin Zohner
+date: "Last run: `r format(Sys.Date(), '%d %B %Y')`"
+
+subtitle: GLDAS data preparation for MODIS pixels
+output:
+  html_document:
+    highlight: haddock
+    toc: false
+    use_bookdown: true
+    df_print: paged
+---
+
+<style>
+body
+  { counter-reset: source-line 0; }
+pre.numberSource code
+  { counter-reset: none; }
+</style>
+
+<br>
+
+### Driver names
+- Daily mean temperature: Daily mean Tair_f_inst
+- Daily maximum temperature: Daily max Tair_f_inst
+- Daily minimum temperature: Daily min Tair_f_inst
+- Total precipitation rate: Rainf_f_tavg
+- Specific humidity: Qair_f_inst
+- Soil moisture: SoilMoi10_40cm_inst
+- Short-wave radiation: Swnet_tavg
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  class.source = "numberLines lineAnchors"
+  )
+```
+
+<br><br>
+
+```{r, message = F, warning=FALSE, attr.source='.numberLines'}
+#####################
+# Required packages #
+#####################
+
+
+
+require(data.table)
+require(tidyverse)
+library(zoo)
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+#############
+# Functions #
+#############
+
+
+
+#-------------------------------------------------------------
+# Set invalid number to NA
+#-------------------------------------------------------------
+
+safe_numeric <- function(x, verbose = TRUE) {  
+  x_char <- as.character(x)
+  numeric_pattern <- "^[-+]?[0-9]+(\\.[0-9]+)?([eE][-+]?[0-9]+)?$"
+  valid_numeric <- grepl(numeric_pattern, x_char)
+  result <- rep(NA_real_, length(x))
+  result[valid_numeric] <- as.numeric(x_char[valid_numeric])
+  if (verbose) {
+    n_invalid <- sum(!valid_numeric, na.rm = TRUE)
+    if (n_invalid > 0) {
+      message(n_invalid, " invalid entries found and set to NA")
+    }
+  }
+  return(result)
+}
+
+
+#-------------------------------------------------------------
+# Replace NAs with neighbor values through interpolation
+#-------------------------------------------------------------
+
+replace_na_with_neighbor_mean <- function(x) {
+  if (!is.numeric(x)) return(x)
+  if (all(is.na(x))) return(x)
+  return(na.approx(x, na.rm = FALSE, rule = 2))
+}
+
+
+#-------------------------------------------------------------
+# Clean dataframe columns
+#-------------------------------------------------------------
+
+clean_and_interpolate_climate_df <- function(df, id_cols = c("lat", "lon", "year", "site_year"), verbose = TRUE) {
+  for (col in names(df)) {
+    if (!(col %in% id_cols)) {
+      df[[col]] <- safe_numeric(df[[col]], verbose = verbose)
+      df[[col]] <- replace_na_with_neighbor_mean(df[[col]])
+    }
+  }
+  return(df)
+}
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+################
+# Define Paths #
+################
+
+
+
+# 1. Input
+##########
+
+GLDASraw.dir = "/Users/consti/Desktop/PhD/Publication_material/40_Spring_phenology_tier2/MODIS_Analysis/Analysis_input/GLDAS_data/ExtractedData"
+MODIS.dir    = "/Users/consti/Desktop/PhD/Publication_material/40_Spring_phenology_tier2/MODIS_Analysis/MODIS_data"
+
+# 2. Output
+###########
+
+GLDAS.dir = "/Users/consti/Desktop/PhD/Publication_material/40_Spring_phenology_tier2/MODIS_Analysis/Analysis_input/GLDAS_data"
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+###########################
+## Prepare and save data ##
+###########################
+
+
+
+# Load phenology data
+MODIS.df <- fread(paste(MODIS.dir, "MODIS_coordinates.csv", sep="/")) 
+
+#define climate variables
+vn1 <- c('Daily_Mean_Data','Daily_Min_Data','Daily_Max_Data', #temperature
+         'Daily_Data','Daily_Data','Daily_Data','Daily_Data')
+vn2 <- c('Tair_f_inst','Tair_f_inst','Tair_f_inst', #temperature
+         'Rainf_f_tavg','SoilMoi10_40cm_inst','Swnet_tavg','Qair_f_inst')
+years = c(2001:2021)
+
+#loop through climate variables
+for(i in 1:length(vn1)) {
+
+  #create empty list
+  DataList <- replicate(length(years),data.frame())
+  
+  #loop through years
+  for(a in 1:length(years)) {
+
+    # create path for files to load
+    ls = paste0(GLDASraw.dir, "/", list.files(path=GLDASraw.dir, pattern=paste0(vn1[i],".+",years[a],".+",vn2[i])))
+    
+    #read data
+    data = do.call(rbind.data.frame, lapply(ls, fread)) %>% 
+      #delete NAs
+      filter(!if_all(c(50:300), is.na)) %>% 
+      #add year and site x year identifier
+      mutate(year = years[a],
+             site_year = paste0(y, '_', x, '_', year)) %>%
+      dplyr::select(-c(.geo, `system:index`, ID)) %>% 
+      #order columns
+      dplyr::select(site_year, year, x, y, everything()) 
+    
+    ### CLEANING STEP
+    data <- clean_and_interpolate_climate_df(data, id_cols = c("site_year", "year", "x", "y"), verbose = TRUE)
+    
+    # Add DOY366 in case year has only 365 days
+    if (ncol(data)<370) {
+      data = data %>% 
+        mutate(`366` = NA) }
+    
+    #add table to list
+    DataList[[a]] = data
+    
+  }
+  
+  # list to dataframe and add to list
+  data = rbindlist(DataList, fill=T) %>% 
+    arrange(y, x, year) %>% 
+    #rename columns
+    rename(lat=y, lon=x) %>% 
+    rename_with(~as.character(1:366), c( (ncol(.)-365) : ncol(.)) ) %>% 
+    # delete sites not found in MODIS data
+    semi_join(MODIS.df, by = c("lat","lon")) 
+  
+  # Save the reduced table  
+  write.table(data, file=paste0(GLDAS.dir, '/', vn1[i], "_", vn2[i], '_red.csv'), sep=',', row.names =F, col.names = T)
+  
+  rm(data, DataList)
+  print(paste0(vn1[i],' ',vn2[i], " done"))
+}
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+#####################
+## Reproducibility ##	
+#####################
+
+
+
+## date time
+Sys.time()
+
+## session info
+sessionInfo()
+
+
+
+##############################################################################################################################################
+#############################################################THE END##########################################################################
+##############################################################################################################################################
+```

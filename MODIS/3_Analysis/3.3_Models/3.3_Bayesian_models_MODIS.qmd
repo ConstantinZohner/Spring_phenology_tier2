@@ -1,0 +1,864 @@
+---
+title: "Spring phenology tier2 project"
+subtitle: "Run Bayesian hierarchical models (MODIS data)"
+author: "Constantin Zohner"
+date: "Last run: `r format(Sys.Date(), '%d %B %Y')`"
+
+format:
+  html:
+    toc: false
+    theme: default
+    highlight-style: haddock
+    df-print: paged
+    embed-resources: true
+
+execute:
+  #warning: false
+  message: false
+  echo: true
+  output: true
+
+always_allow_html: true
+editor: visual
+editor_options:
+  chunk_output_type: inline
+---
+
+<br>
+
+### Driver names
+
+-   MidGreenup_prev: Leaf-out date in the previous year
+-   LSF2: Binary indicator of late spring frost event (\<-2°C) after leaf-out in previous year
+-   MidGreendown_prev: Leaf senescence date in the previous year
+-   Tmean: Daily mean air temperature (°C):
+    -   Previous year:
+        -   EQ1 = March equinox
+        -   SO1 = Summer solstice
+        -   EQ2 = September equinox
+        -   SO2 = December solstice
+    -   From 1-17: 1 = January of previous year, 13 = January of current year
+-   RH: Spring relative air humidity (%)
+-   SWrad: Spring (preseason) incoming short-wave solar radiation (W/m²)
+-   Tmax: Spring (preseason) Daily maximum air temperature (°C)
+
+<br>
+
+# 1. Setup
+
+<details>
+
+<summary>Packages</summary>
+
+```{r, message=F}
+library(tidyverse)
+library(data.table)
+library(car)
+library(brms)
+#install.packages("cmdstanr", repos = c("https://mc-stan.org/r-packages/", getOption("repos")))
+#cmdstanr::install_cmdstan()
+library(cmdstanr)
+options(brms.backend = "cmdstanr")
+```
+
+</details>
+
+<details>
+
+<summary>Directories</summary>
+
+```{r}
+#-------------------------------------------------
+# Define the base directory
+#-------------------------------------------------
+
+base.dir = "/Users/goalie/Desktop/PhD/Publication_material/40_Spring_phenology_tier2/MODIS_Analysis"
+
+
+#-------------------------------------------------
+# Build specific directories from the base
+#-------------------------------------------------
+
+# Model results
+MODIS.dir = file.path(base.dir, "Analysis_input/MODIS_drivers")
+
+# Figure output
+output.dir = file.path(base.dir, "Analysis_output/ModelResults")
+```
+
+</details>
+
+<details>
+
+<summary>Data</summary>
+
+```{r}
+#-----------------------------------------------------------
+# define model variables
+#-----------------------------------------------------------
+
+# List of full variables
+full_variables = c(
+  "year",                                                  # Observation year
+  "Greenup","MidGreenup",                                  # Phenology responses     
+  "Greenup_prev",  "MidGreenup_prev", "MidGreendown_prev", # Previous-year phenology data      
+  "LSF2",                                                  # Previous-year late frost
+  "Tmean.EQ1.SO1", "Tmean.SO1.EQ2", "Tmean.EQ2.SO2",       # Previous-year temperature        
+  "Tmean.GU","RH.GU","SWrad.GU",                           # Preseason climate for Greenup dates   
+  "Tmean.MG","RH.MG","SWrad.MG"                            # Preseason climate for MidGreenup dates     
+)
+
+# List of monthly mean temperature variables    
+monthly_variables = c(
+  "Tmean.8","Tmean.9","Tmean.10","Tmean.11","Tmean.12",           
+  "Tmean.13","Tmean.14","Tmean.15","Tmean.16","Tmean.17"
+)
+
+# Identify continuous variables to be scaled (excluding LSF2 and monthly variables)
+scaled_vars <- setdiff(full_variables, c("LSF2"))
+
+
+#-----------------------------------------------------------
+# Load MODIS data
+#-----------------------------------------------------------
+
+MODIS.df <- fread(paste(MODIS.dir, "MODIS_drivers_spring_data_preseason.csv", sep="/")) %>% 
+  dplyr::select(ForestType_Continent, year, s_id, lat, lon, 
+                all_of(full_variables),
+                all_of(monthly_variables)) %>% 
+  
+  
+  #-----------------------------------------------------------
+  # Data preparation
+  #-----------------------------------------------------------
+
+  mutate(
+    
+    # Add leaf-out date columns that won't be scaled
+    Greenup_DOY    = Greenup,
+    MidGreenup_DOY = MidGreenup) %>% 
+  
+  # Group by pixel (s_id = unique location identifier)
+  group_by(s_id) %>%
+  
+  # Scale each continuous predictor within each pixel
+  # This removes across-site variation in mean/variance,
+  # ensuring that model coefficients reflect within-site effects over time
+  #
+  # → Why is this important?
+  # Because we're interested in whether interannual variation in predictors
+  # (e.g., temperature, RH) explains interannual shifts in phenology,
+  # not whether warmer sites leaf out earlier on average.
+  #
+  # Without this grouping, variables would be scaled globally,
+  # and site-level means could dominate effect estimates —
+  # falsely inflating signals driven by spatial gradients rather than temporal dynamics. 
+  #
+  # Example: If warm lowland sites always have earlier leaf-out, a global
+  # correlation between Tmean and leaf_out could appear strong,
+  # even if within-site interannual correlations are weak or inconsistent.
+  mutate(across(all_of(scaled_vars), ~ as.numeric(scale(.x, center = T, scale = T)))) %>%
+  
+  # Site-level anomalies of predictor variables for monthly models (centered but not scaled)
+  mutate(across(all_of(monthly_variables), 
+                ~ as.numeric(scale(.x, center = T, scale = F)))) %>%
+  
+  # Site-level anomalies of response variables for monthly models (centered but not scaled)
+  mutate(across(c("Greenup_DOY", "MidGreenup_DOY"), 
+                ~ as.numeric(scale(.x, center = T, scale = F)),
+                .names = "{.col}_anomaly")) %>%
+  
+  # Remove group structure
+  ungroup()
+```
+
+</details>
+
+<br>
+
+# 2. Check multicollinearity using variance inflation factors (VIFs)
+
+<details>
+
+<summary>Full models</summary>
+
+```{r}
+#==================================================
+# FULL MODELS — Includes all general predictors
+#==================================================
+
+
+#-----------------------------------------------------------
+# Greenup dates
+#-----------------------------------------------------------
+
+VIF_full_GU.df <- MODIS.df %>%
+  group_by(ForestType_Continent) %>%
+  group_modify(~ {
+    data_subset <- .x
+    
+    # Construct model formula
+    formula <- 
+      Greenup ~ Greenup_prev + LSF2 + MidGreendown_prev + 
+      Tmean.EQ1.SO1 + Tmean.SO1.EQ2 + Tmean.EQ2.SO2 +
+      Tmean.GU + RH.GU + SWrad.GU + year
+    
+    #--------------------------------------------------
+    # Fit model and compute VIFs
+    #--------------------------------------------------
+    model <- lm(formula, data = data_subset)
+    vif_vals <- vif(model)
+    
+    # Return tidy VIF output
+    data.frame(
+      Variable = names(vif_vals),
+      VIF = as.numeric(vif_vals)
+    )
+  }) %>%
+  ungroup() %>%
+  
+  # Reshape into wide format: each species gets its own column
+  pivot_wider(names_from = ForestType_Continent, values_from = VIF)
+
+# View resulting wide-format VIF table
+VIF_full_GU.df
+
+
+#-----------------------------------------------------------
+# Mid-Greenup dates
+#-----------------------------------------------------------
+
+VIF_full_MG.df <- MODIS.df %>%
+  group_by(ForestType_Continent) %>%
+  group_modify(~ {
+    data_subset <- .x
+    
+    # Construct model formula
+    formula <- 
+      MidGreenup ~ MidGreenup_prev + LSF2 + MidGreendown_prev + 
+      Tmean.EQ1.SO1 + Tmean.SO1.EQ2 + Tmean.EQ2.SO2 +
+      Tmean.MG + RH.MG + SWrad.MG + year
+    
+    #--------------------------------------------------
+    # Fit model and compute VIFs
+    #--------------------------------------------------
+    model <- lm(formula, data = data_subset)
+    vif_vals <- vif(model)
+    
+    # Return tidy VIF output
+    data.frame(
+      Variable = names(vif_vals),
+      VIF = as.numeric(vif_vals)
+    )
+  }) %>%
+  ungroup() %>%
+  
+  # Reshape into wide format: each species gets its own column
+  pivot_wider(names_from = ForestType_Continent, values_from = VIF)
+
+# View resulting wide-format VIF table
+VIF_full_MG.df
+```
+
+</details>
+
+<details>
+
+<summary>Monthly models</summary>
+
+```{r}
+#==================================================
+# MONTHLY MODELS — Only include monthly temperature
+# predictors up to the phenologically relevant month
+#==================================================
+
+
+#-----------------------------------------------------------
+# Greenup dates
+#-----------------------------------------------------------
+
+VIF_monthly_GU.df <- MODIS.df %>%
+  group_by(ForestType_Continent) %>%
+  group_map(~ {
+    
+    data_subset <- .x                  # Subset of data for the current species
+    ForestType_Continent_name <- .y$ForestType_Continent   # Current Forest type 
+    
+    # Skip if too few observations
+    if (nrow(data_subset) < 30) return(NULL)
+    
+    #--------------------------------------------------
+    # Determine latest Tmean month to include
+    #--------------------------------------------------
+    mean_doy <- mean(data_subset$Greenup_DOY, na.rm = TRUE)
+    
+    # Estimate approximate month from DOY (1 = Jan, ..., 5 = May)
+    latest_month <- floor((mean_doy - 1) / 30) + 1
+    
+    # Only include a month if leaf-out occurs in its second half
+    if (mean_doy < ((latest_month - 1) * 30 + 15)) {
+      latest_month <- latest_month - 1  # Exclude month if leaf-out too early
+    }
+    
+    # Translate to Tmean variable names: Tmean.8 = August previous year
+    latest_tmean <- min(12 + latest_month, 17)
+    tmean_vars <- if (latest_tmean >= 8) paste0("Tmean.", 8:latest_tmean) else character(0)
+    
+    # Include only if we have at least one Tmean variable
+    predictors <- c(tmean_vars, "year")
+    if (length(predictors) == 0) return(NULL)
+    
+    #--------------------------------------------------
+    # Fit model and compute VIFs
+    #--------------------------------------------------
+    formula <- as.formula(paste("Greenup_DOY_anomaly ~", paste(predictors, collapse = " + ")))
+    
+    model <- tryCatch(lm(formula, data = data_subset), error = function(e) return(NULL))
+    if (is.null(model)) return(NULL)
+    
+    vif_vals <- tryCatch(vif(model), error = function(e) return(NULL))
+    if (is.null(vif_vals) || length(vif_vals) == 0) return(NULL)
+    
+    # Return tidy output with species column
+    data.frame(
+      Variable = names(vif_vals),
+      VIF = as.numeric(vif_vals),
+      ForestType_Continent = ForestType_Continent_name
+    )
+  }) %>%
+  bind_rows() %>%                     # Combine species-wise results into one data frame
+  pivot_wider(                        # Reshape: one column per species
+    names_from = ForestType_Continent,
+    values_from = VIF
+  )
+
+# View resulting wide-format VIF table
+VIF_monthly_GU.df
+
+
+#-----------------------------------------------------------
+# Mid-Greenup dates
+#-----------------------------------------------------------
+
+VIF_monthly_MG.df <- MODIS.df %>%
+  group_by(ForestType_Continent) %>%
+  group_map(~ {
+    
+    data_subset <- .x                  # Subset of data for the current species
+    ForestType_Continent_name <- .y$ForestType_Continent   # Current Forest type 
+    
+    # Skip if too few observations
+    if (nrow(data_subset) < 30) return(NULL)
+    
+    #--------------------------------------------------
+    # Determine latest Tmean month to include
+    #--------------------------------------------------
+    mean_doy <- mean(data_subset$MidGreenup_DOY, na.rm = TRUE)
+    
+    # Estimate approximate month from DOY (1 = Jan, ..., 5 = May)
+    latest_month <- floor((mean_doy - 1) / 30) + 1
+    
+    # Only include a month if leaf-out occurs in its second half
+    if (mean_doy < ((latest_month - 1) * 30 + 15)) {
+      latest_month <- latest_month - 1  # Exclude month if leaf-out too early
+    }
+    
+    # Translate to Tmean variable names: Tmean.8 = August previous year
+    latest_tmean <- min(12 + latest_month, 17)
+    tmean_vars <- if (latest_tmean >= 8) paste0("Tmean.", 8:latest_tmean) else character(0)
+    
+    # Include only if we have at least one Tmean variable
+    predictors <- c(tmean_vars, "year")
+    if (length(predictors) == 0) return(NULL)
+    
+    #--------------------------------------------------
+    # Fit model and compute VIFs
+    #--------------------------------------------------
+    formula <- as.formula(paste("MidGreenup_DOY_anomaly ~", paste(predictors, collapse = " + ")))
+    
+    model <- tryCatch(lm(formula, data = data_subset), error = function(e) return(NULL))
+    if (is.null(model)) return(NULL)
+    
+    vif_vals <- tryCatch(vif(model), error = function(e) return(NULL))
+    if (is.null(vif_vals) || length(vif_vals) == 0) return(NULL)
+    
+    # Return tidy output with species column
+    data.frame(
+      Variable = names(vif_vals),
+      VIF = as.numeric(vif_vals),
+      ForestType_Continent = ForestType_Continent_name
+    )
+  }) %>%
+  bind_rows() %>%                     # Combine species-wise results into one data frame
+  pivot_wider(                        # Reshape: one column per species
+    names_from = ForestType_Continent,
+    values_from = VIF
+  )
+
+# View resulting wide-format VIF table
+VIF_monthly_MG.df
+```
+
+</details>
+
+<br>
+
+# 3. Run Bayesian hierarchical models
+
+<details>
+
+<summary>Full models</summary>
+
+```{r}
+#==================================================
+# Define priors and formulae
+#==================================================
+
+
+#-----------------------------------------------------------
+# Define priors
+#-----------------------------------------------------------
+
+priors_brm <- c(
+  # Fixed effects — weakly informative (small shrinkage)
+  set_prior("normal(0, 1)", class = "b"), 
+  
+  # Intercept — mild regularization (helps model intercept stability)
+  set_prior("normal(0, 1)", class = "Intercept"), 
+  
+   # Residual SD (sigma):
+  set_prior("student_t(3, 0, 1)", class = "sigma"),
+  
+  # General SDs for random effects — conservative, heavy tails
+  set_prior("student_t(3, 0, 2.5)", class = "sd"), 
+  
+  # Specific shrinkage for random slope of year by timeseries
+  set_prior("normal(0, 0.5)", class = "sd", group = "s_id", coef = "year")
+)
+
+#-----------------------------------------------------------
+# Define modeling formulae
+#-----------------------------------------------------------
+
+# To account for temporal trends in phenology and potential non-independence of observations across years within each site, 
+# we included year as a random slope grouped by timeseries using an uncorrelated random effects structure (year || timeseries). 
+# This formulation allows both the baseline phenology (intercept) and the temporal trend (slope of year) to vary across sites, 
+# while simplifying model complexity by not estimating the correlation between them.
+#
+# By doing so, we capture spatial heterogeneity in long-term phenological trends and reduce the risk of inflated fixed-effect 
+# estimates caused by unmodeled site-specific trajectories. This specification preserves our ability to detect interannual 
+# relationships between climate predictors and leaf-out timing within sites, while controlling for varying temporal baselines 
+# across locations in a computationally efficient and statistically robust manner.
+
+# Greenup models
+formula_GU <- bf(
+  Greenup ~ Greenup_prev + LSF2 + Tmean.EQ1.SO1 + Tmean.SO1.EQ2 + MidGreendown_prev +
+    Tmean.EQ2.SO2 + Tmean.GU + RH.GU + SWrad.GU + (year || s_id)
+)
+
+# MidGreenup models
+formula_MG <- bf(
+  MidGreenup ~ MidGreenup_prev + LSF2 + Tmean.EQ1.SO1 + Tmean.SO1.EQ2 + MidGreendown_prev +
+    Tmean.EQ2.SO2 + Tmean.MG + RH.MG + SWrad.MG + (year || s_id)
+)
+
+#-----------------------------------------------------------
+# Setup: model loop across forest types
+#-----------------------------------------------------------
+
+ForestType_Continent_list <- unique(MODIS.df$ForestType_Continent)
+
+
+
+#===============================================================================================================================
+
+
+
+#==================================================
+# Greenup date models
+#==================================================
+
+
+#-----------------------------------------------------------
+# Loop over each forest type
+#-----------------------------------------------------------
+
+models <- list() # Create empty list to store models
+
+for (ft in ForestType_Continent_list) {
+  
+  cat("Running model for ForestType_Continent:", ft, "\n")
+   
+  # Create sublist for each forest type
+  models[[ft]] <- list()           
+    
+  # Subset the data for this species and period
+  data_sub <- MODIS.df %>% filter(ForestType_Continent == ft)
+    
+  # Skip if there are too few observations for stable estimation
+  if (nrow(data_sub) < 30) {
+    cat("Skipping species due to insufficient data:", sp, "\n")
+    next
+  }
+    
+  #-----------------------------------------------------------
+  # Fit the model using brms and CmdStanR backend
+  #-----------------------------------------------------------
+    
+  models[[ft]] <- brm(
+    formula = formula_GU,            # The model formula
+    data = data_sub,                 # Subset of data for this forest type
+    family = gaussian(),             # Specifies a Gaussian likelihood (appropriate for continuous 'leaf_out' response)
+    prior = priors_brm,              # Priors for intercept, fixed effects, and random effect standard deviations
+      
+    backend = "cmdstanr",            # Use CmdStanR backend for efficient and parallel sampling
+    #init = 0,                        # Initialize all model parameters at 0 (can help avoid divergent transitions early on)
+      
+    chains = 4,                      # Number of MCMC chains to run (default is 4)
+    cores = 12,                      # Number of CPU cores used in total
+    threads = threading(threads = 3),# Run 3 threads per chain (parallelized within-chain sampling; total = 4 × 3 = 12)
+      
+    iter = 4000,                     # Total number of iterations per chain (including warmup)
+    warmup = 1000,                   # Number of warmup (burn-in) iterations per chain
+      
+    control = list(
+      adapt_delta = 0.95,            # Target acceptance probability for the sampler (higher = fewer divergences)
+      max_treedepth = 15             # Maximum depth of the NUTS tree (helps with complex posterior geometry)
+    ),
+      
+    seed = 123                       # Set random seed for reproducibility
+  )
+}
+
+#-----------------------------------------------------------
+# Save all fitted models to disk
+#-----------------------------------------------------------
+
+saveRDS(models, file = file.path(output.dir, "brms_full_GU_models.rds"))
+
+
+
+#===============================================================================================================================
+
+
+
+#==================================================
+# Mid-Greenup date models
+#==================================================
+
+
+#-----------------------------------------------------------
+# Loop over each forest type
+#-----------------------------------------------------------
+
+models <- list() # Create empty list to store models
+
+for (ft in ForestType_Continent_list) {
+  
+  cat("Running model for ForestType_Continent:", ft, "\n")
+  
+  # Create sublist for each forest type
+  models[[ft]] <- list()           
+  
+  # Subset the data for this species and period
+  data_sub <- MODIS.df %>% filter(ForestType_Continent == ft)
+  
+  # Skip if there are too few observations for stable estimation
+  if (nrow(data_sub) < 30) {
+    cat("Skipping species due to insufficient data:", sp, "\n")
+    next
+  }
+  
+  #-----------------------------------------------------------
+  # Fit the model using brms and CmdStanR backend
+  #-----------------------------------------------------------
+  
+  models[[ft]] <- brm(
+    formula = formula_MG,            # The model formula
+    data = data_sub,                 # Subset of data for this forest type
+    family = gaussian(),             # Specifies a Gaussian likelihood (appropriate for continuous 'leaf_out' response)
+    prior = priors_brm,              # Priors for intercept, fixed effects, and random effect standard deviations
+    
+    backend = "cmdstanr",            # Use CmdStanR backend for efficient and parallel sampling
+    #init = 0,                        # Initialize all model parameters at 0 (can help avoid divergent transitions early on)
+    
+    chains = 4,                      # Number of MCMC chains to run (default is 4)
+    cores = 12,                      # Number of CPU cores used in total
+    threads = threading(threads = 3),# Run 3 threads per chain (parallelized within-chain sampling; total = 4 × 3 = 12)
+    
+    iter = 4000,                     # Total number of iterations per chain (including warmup)
+    warmup = 1000,                   # Number of warmup (burn-in) iterations per chain
+    
+    control = list(
+      adapt_delta = 0.95,            # Target acceptance probability for the sampler (higher = fewer divergences)
+      max_treedepth = 15             # Maximum depth of the NUTS tree (helps with complex posterior geometry)
+    ),
+    
+    seed = 123                       # Set random seed for reproducibility
+  )
+}
+
+#-----------------------------------------------------------
+# Save all fitted models to disk
+#-----------------------------------------------------------
+
+saveRDS(models, file = file.path(output.dir, "brms_full_MG_models.rds"))
+```
+
+</details>
+
+<details>
+
+<summary>Monthly models</summary>
+
+```{r}
+#==================================================
+# Define phenology cut-offs and formulae
+#==================================================
+
+
+#-----------------------------------------------------------
+# Calculate average leaf-out DOY per forest type (across all years)
+# Used to determine which monthly temperature predictors to include
+#-----------------------------------------------------------
+
+ForestType_Continent_leaf_out = MODIS.df %>% 
+  group_by(ForestType_Continent) %>% 
+  summarise(mean_Greenup    = mean(Greenup_DOY, na.rm = TRUE),
+            mean_MidGreenup = mean(MidGreenup_DOY, na.rm = TRUE)) %>%
+  arrange(mean_Greenup)
+ForestType_Continent_leaf_out
+
+#-----------------------------------------------------------
+# Define priors
+#-----------------------------------------------------------
+
+priors_brm <- c(
+  # Fixed effects — weakly informative (small shrinkage)
+  set_prior("normal(0, 1.5)", class = "b"), 
+  
+  # Intercept — mild regularization (helps model intercept stability)
+  set_prior("normal(0, 2)", class = "Intercept"), 
+  
+   # Residual SD (sigma):
+  set_prior("student_t(3, 0, 3)", class = "sigma"),
+  
+  # General SDs for random effects — conservative, heavy tails
+  set_prior("student_t(3, 0, 3)", class = "sd"), 
+  
+  # Specific shrinkage for random slope of year by timeseries
+  set_prior("normal(0, 0.5)", class = "sd", group = "s_id", coef = "year")
+)
+
+#-----------------------------------------------------------
+# Setup model structure
+#-----------------------------------------------------------
+
+ForestType_Continent_list <- unique(MODIS.df$ForestType_Continent)
+
+
+
+#===============================================================================================================================
+
+
+
+#==================================================
+# Greenup date models
+#==================================================
+
+
+#-----------------------------------------------------------
+# Loop over each period × species combination
+#-----------------------------------------------------------
+
+models <- list()
+  
+for (ft in ForestType_Continent_list) {
+    
+  cat("Running model for Forest Type:", ft, "\n")
+    
+  # Create sublist for each forest type
+  models[[ft]] <- list()
+    
+  # Subset data for this species and period
+  data_sub <- MODIS.df %>% filter(ForestType_Continent == ft)
+    
+  # Skip model fitting if insufficient data
+  if (nrow(data_sub) < 30) {
+    cat("Skipping species due to insufficient data:", ft, "\n")
+    next
+  }
+    
+  #-----------------------------------------------------------
+  # Select monthly temperature predictors based on leaf-out timing
+  #-----------------------------------------------------------
+    
+  # Get forest type-specific average leaf-out day
+  mean_doy <- ForestType_Continent_leaf_out[ForestType_Continent_leaf_out$ForestType_Continent==ft,]$mean_Greenup
+    
+  # Convert DOY to approximate month (1 = Jan, 5 = May, etc.)
+  latest_month <- floor((mean_doy - 1) / 30) + 1
+    
+  # Only include monthly temperature if leaf-out occurs in the second half of that month
+  if (mean_doy < ((latest_month - 1) * 30 + 15)) {
+    latest_month <- latest_month - 1  # Too early → exclude current month
+  }
+    
+  # Convert calendar month to Tmean.X format (Tmean.8 = August prev year)
+  latest_tmean <- 12 + latest_month  # e.g., March → Tmean.15
+    
+  # Dynamically build Tmean term string (e.g., Tmean.8 + Tmean.9 + ...)
+  tmean_terms <- paste0("Tmean.", 8:latest_tmean, collapse = " + ")
+    
+  # Build model formula string including only relevant months + uncorrelated random slopes for year by timeseries
+  formula_string <- paste("Greenup_DOY_anomaly ~", tmean_terms, "+ (year || s_id)")
+  formula <- bf(as.formula(formula_string)) # Convert to brms formula
+    
+  #-----------------------------------------------------------
+  # Fit the Bayesian model
+  #-----------------------------------------------------------
+    
+  models[[ft]] <- brm(
+    formula = formula,               # The model formula, chosen dynamically
+    data = data_sub,                 # Subset of data for this species and period
+    family = gaussian(),             # Specifies a Gaussian likelihood (appropriate for continuous 'leaf_out' response)
+    prior = priors_brm,              # Priors for intercept, fixed effects, and random effect standard deviations
+      
+    backend = "cmdstanr",            # Use CmdStanR backend for efficient and parallel sampling
+    #init = 0,                        # Initialize all model parameters at 0 (can help avoid divergent transitions early on)
+      
+    chains = 4,                      # Number of MCMC chains to run (default is 4)
+    cores = 12,                      # Number of CPU cores used in total
+    threads = threading(threads = 3),# Run 3 threads per chain (parallelized within-chain sampling; total = 4 × 3 = 12)
+      
+    iter = 4000,                     # Total number of iterations per chain (including warmup)
+    warmup = 1000,                   # Number of warmup (burn-in) iterations per chain
+      
+    control = list(
+    adapt_delta = 0.95,              # Target acceptance probability for the sampler (higher = fewer divergences)
+      max_treedepth = 15             # Maximum depth of the NUTS tree (helps with complex posterior geometry)
+    ),
+      
+    seed = 123                       # Set random seed for reproducibility
+  )
+}
+
+#-----------------------------------------------------------
+# Save all fitted models to disk
+#-----------------------------------------------------------
+
+saveRDS(models, file = file.path(output.dir, "brms_monthly_GU_models.rds"))
+
+
+
+#===============================================================================================================================
+
+
+
+#==================================================
+# Mid-Greenup date models
+#==================================================
+
+
+#-----------------------------------------------------------
+# Loop over each period × species combination
+#-----------------------------------------------------------
+
+models <- list()
+
+for (ft in ForestType_Continent_list) {
+  
+  cat("Running model for Forest Type:", ft, "\n")
+  
+  # Create sublist for each forest type
+  models[[ft]] <- list()
+  
+  # Subset data for this species and period
+  data_sub <- MODIS.df %>% filter(ForestType_Continent == ft)
+  
+  # Skip model fitting if insufficient data
+  if (nrow(data_sub) < 30) {
+    cat("Skipping species due to insufficient data:", ft, "\n")
+    next
+  }
+  
+  #-----------------------------------------------------------
+  # Select monthly temperature predictors based on leaf-out timing
+  #-----------------------------------------------------------
+  
+  # Get forest type-specific average leaf-out day
+  mean_doy <- ForestType_Continent_leaf_out[ForestType_Continent_leaf_out$ForestType_Continent==ft,]$mean_MidGreenup
+  
+  # Convert DOY to approximate month (1 = Jan, 5 = May, etc.)
+  latest_month <- floor((mean_doy - 1) / 30) + 1
+  
+  # Only include monthly temperature if leaf-out occurs in the second half of that month
+  if (mean_doy < ((latest_month - 1) * 30 + 15)) {
+    latest_month <- latest_month - 1  # Too early → exclude current month
+  }
+  
+  # Convert calendar month to Tmean.X format (Tmean.8 = August prev year)
+  latest_tmean <- 12 + latest_month  # e.g., March → Tmean.15
+  
+  # Dynamically build Tmean term string (e.g., Tmean.8 + Tmean.9 + ...)
+  tmean_terms <- paste0("Tmean.", 8:latest_tmean, collapse = " + ")
+  
+  # Build model formula string including only relevant months + uncorrelated random slopes for year by timeseries
+  formula_string <- paste("MidGreenup_DOY_anomaly ~", tmean_terms, "+ (year || s_id)")
+  formula <- bf(as.formula(formula_string)) # Convert to brms formula
+  
+  #-----------------------------------------------------------
+  # Fit the Bayesian model
+  #-----------------------------------------------------------
+  
+  models[[ft]] <- brm(
+    formula = formula,               # The model formula, chosen dynamically
+    data = data_sub,                 # Subset of data for this species and period
+    family = gaussian(),             # Specifies a Gaussian likelihood (appropriate for continuous 'leaf_out' response)
+    prior = priors_brm,              # Priors for intercept, fixed effects, and random effect standard deviations
+    
+    backend = "cmdstanr",            # Use CmdStanR backend for efficient and parallel sampling
+    #init = 0,                        # Initialize all model parameters at 0 (can help avoid divergent transitions early on)
+    
+    chains = 4,                      # Number of MCMC chains to run (default is 4)
+    cores = 12,                      # Number of CPU cores used in total
+    threads = threading(threads = 3),# Run 3 threads per chain (parallelized within-chain sampling; total = 4 × 3 = 12)
+    
+    iter = 4000,                     # Total number of iterations per chain (including warmup)
+    warmup = 1000,                   # Number of warmup (burn-in) iterations per chain
+    
+    control = list(
+      adapt_delta = 0.95,              # Target acceptance probability for the sampler (higher = fewer divergences)
+      max_treedepth = 15             # Maximum depth of the NUTS tree (helps with complex posterior geometry)
+    ),
+    
+    seed = 123                       # Set random seed for reproducibility
+  )
+}
+
+#-----------------------------------------------------------
+# Save all fitted models to disk
+#-----------------------------------------------------------
+
+saveRDS(models, file = file.path(output.dir, "brms_monthly_MG_models.rds"))
+```
+
+</details>
+
+<br>
+
+# 4. Reproducibility
+
+<details>
+
+<summary>show</summary>
+
+```{r}
+# Datetime
+Sys.time()
+
+# Session info
+sessionInfo()
+```
+
+</details>

@@ -1,0 +1,173 @@
+---
+title: Spring phenology tier2 project
+author: Constantin Zohner
+date: "last updated 10 February 2025"
+
+subtitle: R code to extract EOBS data from point coordinates
+output:
+  html_document:
+    highlight: haddock
+    toc: false
+    use_bookdown: true
+    df_print: paged
+---
+
+<style>
+body
+  { counter-reset: source-line 0; }
+pre.numberSource code
+  { counter-reset: none; }
+</style>
+
+<br>
+
+### Variables
+- tn: daily minimum temperature
+- tx: daily maximum temperature
+- tg: daily average temperature
+- qq: short-wave radiation
+- rr: daily precipitation sum
+- hu: daily mean relative humidity
+- pp: daily mean sea level pressure
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  class.source = "numberLines lineAnchors"
+  )
+```
+
+<br><br>
+
+```{r, message=FALSE, warning=FALSE, attr.source='.numberLines'}
+##############
+## Packages ##
+##############
+
+
+
+require(tidyverse)
+require(data.table)
+require(readr)
+require(terra)
+require(raster)
+require(ncdf4)
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+#####################
+## Set directories ##
+#####################
+
+
+
+# Paths
+PEP_path    = "/Users/consti/Desktop/PhD/Publication_material/40_Spring_phenology_tier2/PEP725_Analysis/PEP_data"
+EOBS_path   = "/Users/consti/Desktop/PhD/Publication_material/30_Premature_senescence/Analysis/PEP/EOBS_data/Full_data"
+EOBS_output = "/Users/consti/Desktop/PhD/Publication_material/40_Spring_phenology_tier2/PEP725_Analysis/Analysis_input/EOBS_data"
+
+
+# List all NetCDF files
+eobs_files <- list.files(path = EOBS_path, pattern = "\\.nc$", full.names = TRUE)
+print(eobs_files)
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+##################
+## Extract data ##
+##################
+
+
+
+# Load coordinates from PEP dataset
+coords <- fread(paste(PEP_path, "PEP725_coordinates.csv", sep="/"))
+
+# Loop through each variable and year
+for (var in eobs_files) {
+  
+  cat("Processing variable:", basename(var), "\n")
+  
+  # Load the raster data from the .nc file
+  raster_data <- terra::rast(var)
+  
+  # Define the start date and number of layers per year
+  start_date <- as.Date("1950-01-01")
+  time_steps <- terra::time(raster_data)  # Extract time metadata if available
+  if (is.null(time_steps)) {
+    time_steps <- seq.Date(start_date, by = "day", length.out = nlyr(raster_data))
+  }
+  
+  # Group layers by year
+  years <- c(1950:2023)
+  
+  # Initialize an empty list to store results
+  results_list <- list()
+  
+  # Loop through years
+  for (year in years) {
+    
+    cat("Processing year:", year, "\n")
+    
+    # Get layers for the current year
+    year_layers   <- which(format(time_steps, "%Y") == year)
+    yearly_raster <- raster_data[[year_layers]]  # Subset raster layers
+    
+    # Extract data for the coordinates
+    extracted_values <- terra::extract(yearly_raster, coords[, c("lon", "lat")], df = TRUE)
+    
+    # Clean and rename
+    extracted_values <- extracted_values %>% 
+      dplyr::select(-ID) %>%  # Remove the 'ID' column
+      rename_with(~ as.character(1:(ncol(extracted_values)-1)))  # Rename columns as 1, 2, ..., 365/366
+    
+    # Combine the coordinates with the extracted values
+    extracted_values <- cbind(year, coords, extracted_values) %>% 
+      mutate(site_year = paste(s_id, year, sep="_")) %>% # add site x year identifier
+      filter(!if_all(`1`:`365`, is.na)) # delete NAs
+    
+    # Append to results list
+    results_list[[year]] <- extracted_values
+  }
+  
+  # Optionally combine all yearly results into one data frame
+  final_results <- bind_rows(results_list) 
+  
+  # Save the final combined dataset
+  output_file <- paste0(EOBS_output, "/", sub("\\.nc$", ".csv", basename(var)))
+  write.csv(final_results, output_file, row.names = FALSE)
+}
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+#####################
+## Reproducibility ##	
+#####################
+
+
+
+## date time
+Sys.time()
+
+## session info
+sessionInfo()
+
+
+
+##############################################################################################################################################
+#############################################################THE END##########################################################################
+##############################################################################################################################################
+```

@@ -1,0 +1,952 @@
+---
+title: "Spring phenology tier2 project"
+subtitle: "Alternate Bayesian model figures (MODIS data)"
+author: "Constantin Zohner"
+date: "Last run: `r format(Sys.Date(), '%d %B %Y')`"
+
+format:
+  html:
+    toc: false
+    theme: default
+    highlight-style: haddock
+    df-print: paged
+    embed-resources: true
+
+execute:
+  #warning: false
+  message: false
+  echo: true
+  output: true
+
+always_allow_html: true
+editor: visual
+editor_options:
+  chunk_output_type: inline
+---
+
+<br>
+
+### Models
+
+-   Full_noSpring: no specific preseason temperature, just mean Jan to March temperatures
+-   Full_noScale: no site-level centering (and scaling) of variables, just global scaling
+-   Full_noYear: no year term
+
+### Variable names
+
+#### Preseason
+
+##### (start and end dates vary across time series; start date = fitted; end date = time series-level mean leaf-out)
+
+-   Tmean: Preseason mean/maximum daily air temperature
+-   SWrad: Preseason short-wave radiation
+-   RH: Preseason relative humidity
+
+#### Fixed periods
+
+-   Tmean.EQ1.SO1: Mean daily air temperature (March equinox to summer solstice of preceding year)
+-   Tmean.SO1.EQ2: Mean daily air temperature (Summer solstice to September equinox of preceding year)
+-   Tmean.EQ2.SO2: Mean daily air temperature (September equinox to winter solstice of preceding year)
+
+#### Phenology
+
+-   Greenup_prev: Leaf-out date of preceding year
+-   MidGreendown_prev: Leaf senescence date of preceding year
+
+#### Late frosts in preceding year
+
+-   LSF2: Binary indicator of late spring frost (\<-2°C) events occurring after leaf-out in the previous year
+
+<br>
+
+# 1. Setup
+
+<details>
+
+<summary>Packages</summary>
+
+```{r, message=F}
+library(tidyverse)
+library(ggplot2)
+library(patchwork)
+library(ggpattern)
+library(brms)
+library(posterior)
+library(rstan)
+library(pracma)
+```
+
+</details>
+
+<details>
+
+<summary>Functions</summary>
+
+```{r, message=F}
+#-----------------------------------------------------------
+# Extract key convergence diagnostics from a brmsfit model
+#-----------------------------------------------------------
+
+extract_diagnostics <- function(model, ForestType_Continent) {
+  draws <- as_draws_df(model)
+  diag_summary <- summarise_draws(draws)
+  data.frame(
+    ForestType_Continent = ForestType_Continent,
+    max_rhat = max(diag_summary$rhat, na.rm = TRUE),               # Rhat convergence statistic
+    min_ess_bulk = min(diag_summary$ess_bulk, na.rm = TRUE),       # Minimum effective sample size (bulk)
+    min_ess_tail = min(diag_summary$ess_tail, na.rm = TRUE),       # Minimum effective sample size (tail)
+    n_divergent = sum(model$diagnostic_summary$divergent__),       # Total number of divergent transitions
+    treedepth_exceeded = sum(model$diagnostic_summary$treedepth__) # Total number of transitions exceeding tree depth
+  )
+}
+
+
+#-----------------------------------------------------------
+# Interpolation function
+#-----------------------------------------------------------
+
+lin_interp = function(x, y, length.out=100) {
+  approx(x, y, xout=seq(min(x), max(x), length.out=length.out))$y
+}
+```
+
+</details>
+
+<details>
+
+<summary>Plot theme</summary>
+
+```{r, message=F}
+plotTheme1 = theme(legend.position   = "none",
+                   legend.background = element_rect(fill=NA, linewidth=0.5, linetype="solid"),
+                   legend.text       = element_text(color="black"),
+                   panel.grid.major  = element_line(color = "grey90"),
+                   panel.background  = element_blank(),
+                   panel.border      = element_rect(colour = "black", fill=NA),
+                   axis.line         = element_line(color = "black"),
+                   axis.text         = element_text(colour = "black"),
+                   strip.background  = element_rect(fill=NA),
+                   strip.text        = element_text(colour = 'black'),
+                   plot.title        = element_text(hjust = 0.5))
+```
+
+</details>
+
+<details>
+
+<summary>Directories</summary>
+
+```{r}
+#-------------------------------------------------
+# Define the base directory
+#-------------------------------------------------
+
+base.dir = "/Users/goalie/Desktop/PhD/Publication_material/40_Spring_phenology_tier2/MODIS_Analysis/Analysis_output"
+
+
+#-------------------------------------------------
+# Build specific directories from the base
+#-------------------------------------------------
+
+# Model results
+model.dir = file.path(base.dir, "ModelResults")
+
+# Figure output
+output.dir = file.path(base.dir, "ModelFigures")
+```
+
+</details>
+
+<details>
+
+<summary>Data</summary>
+
+```{r}
+#----------------------------------------------------
+# no spring preseason model
+#----------------------------------------------------
+
+model.noSpring    = readRDS(file.path(model.dir, "brms_full_GU_models_noSpring.rds"))
+
+
+#----------------------------------------------------
+# no site-level scaling model
+#----------------------------------------------------
+
+model.noScale    = readRDS(file.path(model.dir, "brms_full_GU_models_noScale.rds"))
+
+
+#----------------------------------------------------
+# no Year model
+#----------------------------------------------------
+
+model.noYear    = readRDS(file.path(model.dir, "brms_full_GU_models_noYear.rds"))
+```
+
+</details>
+
+<br>
+
+# 2. Model diagnostics
+
+<details>
+
+<summary>No Spring model</summary>
+
+```{r}
+##################################################################
+## Prepare Diagnostics — Rhat, ESS bulk, ESS tail across models ##
+##################################################################
+
+
+
+#-----------------------------------------------------------
+# 1. Flatten model diagnostics into one data frame
+#-----------------------------------------------------------
+
+diagnostics.df <- imap_dfr(model.noSpring, function(ForestType_Continent_list, ForestType_Continent) {
+    extract_diagnostics(ForestType_Continent_list, ForestType_Continent = ForestType_Continent)
+  }) %>%
+  # Tidy and reorder variables
+  mutate(ForestType_Continent = factor(ForestType_Continent, levels = rev(sort(unique(ForestType_Continent)))))  # alphabetical order
+
+
+#-----------------------------------------------------------
+# 2. Summarize convergence diagnostics across models
+#-----------------------------------------------------------
+
+summary_stats <- diagnostics.df %>%
+  # Calculate summary statistics within each group
+  summarise(
+    prop_rhat_ok = mean(max_rhat < 1.01),        # Proportion of models with Rhat < 1.02 (indicates good convergence)
+    prop_ess_bulk_ok = mean(min_ess_bulk > 400), # Proportion of models with bulk ESS > 200 (good sampling in the posterior bulk)
+    prop_ess_tail_ok = mean(min_ess_tail > 400), # Proportion of models with tail ESS > 200 (good sampling in the posterior tails)
+    n_divergent_total = sum(n_divergent),        # Total number of divergent transitions across all models in the group
+    n_treedepth_total = sum(treedepth_exceeded), # Total number of transitions that exceeded the maximum tree depth
+    .groups = "drop" # Remove grouping structure in the resulting data frame
+  )
+
+# Display the summary statistics table
+summary_stats
+
+
+
+#################################################################
+## Visual Diagnostics — Rhat, ESS bulk, ESS tail across models ##
+#################################################################
+
+
+
+#-----------------------------------------------------------
+# Plot A: Maximum Rhat (Convergence diagnostic)
+# - Rhat < 1.01: safe convergence
+# - Rhat > 1.05: problematic convergence
+#-----------------------------------------------------------
+
+Rhat = ggplot(diagnostics.df, aes(x = ForestType_Continent, y = max_rhat)) +
+  geom_point(size = 1.5) +
+  geom_hline(yintercept = 1.01, linetype = "dashed", color = "black") +
+  geom_hline(yintercept = 1.05, linetype = "solid", color = "red") +
+  labs(
+    x = "",
+    y = "Maximum Rhat (Model convergence)",
+    color = "Model"
+  ) +
+  coord_flip() +
+  plotTheme1+
+  theme(legend.position = "top")
+
+#-----------------------------------------------------------
+# Plot B: Bulk ESS (Effective sample size for bulk of posterior)
+# - ESS < 400: potentially problematic
+# - ESS < 100: critical
+#-----------------------------------------------------------
+
+Bulk = ggplot(diagnostics.df, aes(x = ForestType_Continent, y = min_ess_bulk)) +
+  geom_point(size = 1.5) +
+  geom_hline(yintercept = 100, linetype = "solid", color = "red") +    # absolute minimum threshold
+  geom_hline(yintercept = 400, linetype = "dashed", color = "black") + # ideal minimum
+  labs(x = "", y = "Minimum Bulk ESS") +
+  coord_flip() +
+  plotTheme1
+
+#-----------------------------------------------------------
+# Plot C: Tail ESS (Effective sample size for distribution tails)
+# - Same thresholds as Bulk ESS
+#-----------------------------------------------------------
+
+Tail = ggplot(diagnostics.df, aes(x = ForestType_Continent, y = min_ess_tail)) +
+  geom_point(size = 1.5) +
+  geom_hline(yintercept = 100, linetype = "solid", color = "red") +    # critical threshold
+  geom_hline(yintercept = 400, linetype = "dashed", color = "black") + # ideal minimum
+  labs(x = "", y = "Minimum Tail ESS") +
+  coord_flip() +
+  plotTheme1 
+
+#-----------------------------------------------------------
+# Merge and safe plots
+#-----------------------------------------------------------
+
+#define plot layouts
+layout <- "
+A
+B
+C"
+
+#Merge plots
+diagnostics_noSpring.plot = Rhat + Bulk + Tail +
+  plot_layout(design = layout) + plot_annotation(tag_levels = 'a')&
+  theme(plot.tag = element_text(face = 'bold'))
+
+#save plots as .pdf
+ggsave(diagnostics_noSpring.plot, file="diagnostics_full_GU_model_noSpring.pdf", path=output.dir,
+       width=6, height=6)
+
+diagnostics_noSpring.plot 
+```
+
+</details>
+
+<details>
+
+<summary>No Scale model</summary>
+
+```{r}
+##################################################################
+## Prepare Diagnostics — Rhat, ESS bulk, ESS tail across models ##
+##################################################################
+
+
+
+#-----------------------------------------------------------
+# 1. Flatten model diagnostics into one data frame
+#-----------------------------------------------------------
+
+diagnostics.df <- imap_dfr(model.noScale, function(ForestType_Continent_list, ForestType_Continent) {
+    extract_diagnostics(ForestType_Continent_list, ForestType_Continent = ForestType_Continent)
+  }) %>%
+  # Tidy and reorder variables
+  mutate(ForestType_Continent = factor(ForestType_Continent, levels = rev(sort(unique(ForestType_Continent)))))  # alphabetical order
+
+
+#-----------------------------------------------------------
+# 2. Summarize convergence diagnostics across models
+#-----------------------------------------------------------
+
+summary_stats <- diagnostics.df %>%
+  # Calculate summary statistics
+  summarise(
+    prop_rhat_ok = mean(max_rhat < 1.01),        # Proportion of models with Rhat < 1.01 (indicates safe convergence)
+    prop_ess_bulk_ok = mean(min_ess_bulk > 400), # Proportion of models with bulk ESS > 400 (ideal sampling in the posterior bulk)
+    prop_ess_tail_ok = mean(min_ess_tail > 400), # Proportion of models with tail ESS > 400 (ideal sampling in the posterior tails)
+    n_divergent_total = sum(n_divergent),        # Total number of divergent transitions across all models in the group
+    n_treedepth_total = sum(treedepth_exceeded), # Total number of transitions that exceeded the maximum tree depth
+    .groups = "drop" # Remove grouping structure in the resulting data frame
+  )
+
+# Display the summary statistics table
+summary_stats
+
+
+
+#################################################################
+## Visual Diagnostics — Rhat, ESS bulk, ESS tail across models ##
+#################################################################
+
+
+
+#-----------------------------------------------------------
+# Plot A: Maximum Rhat (Convergence diagnostic)
+# - Rhat < 1.01: safe convergence
+# - Rhat > 1.05: problematic convergence
+#-----------------------------------------------------------
+
+Rhat = ggplot(diagnostics.df, aes(x = ForestType_Continent, y = max_rhat)) +
+  geom_point(size = 1.5) +
+  geom_hline(yintercept = 1.01, linetype = "dashed", color = "black") +
+  geom_hline(yintercept = 1.05, linetype = "solid", color = "red") +
+  labs(
+    x = "",
+    y = "Maximum Rhat (Model convergence)",
+    color = "Model"
+  ) +
+  coord_flip() +
+  plotTheme1+
+  theme(legend.position = "top")
+
+#-----------------------------------------------------------
+# Plot B: Bulk ESS (Effective sample size for bulk of posterior)
+# - ESS < 400: potentially problematic
+# - ESS < 100: critical
+#-----------------------------------------------------------
+
+Bulk = ggplot(diagnostics.df, aes(x = ForestType_Continent, y = min_ess_bulk)) +
+  geom_point(size = 1.5) +
+  geom_hline(yintercept = 100, linetype = "solid", color = "red") +    # absolute minimum threshold
+  geom_hline(yintercept = 400, linetype = "dashed", color = "black") + # ideal minimum
+  labs(x = "", y = "Minimum Bulk ESS") +
+  coord_flip() +
+  plotTheme1
+
+#-----------------------------------------------------------
+# Plot C: Tail ESS (Effective sample size for distribution tails)
+# - Same thresholds as Bulk ESS
+#-----------------------------------------------------------
+
+Tail = ggplot(diagnostics.df, aes(x = ForestType_Continent, y = min_ess_tail)) +
+  geom_point(size = 1.5) +
+  geom_hline(yintercept = 100, linetype = "solid", color = "red") +    # critical threshold
+  geom_hline(yintercept = 400, linetype = "dashed", color = "black") + # ideal minimum
+  labs(x = "", y = "Minimum Tail ESS") +
+  coord_flip() +
+  plotTheme1
+
+#-----------------------------------------------------------
+# Merge and safe plots
+#-----------------------------------------------------------
+
+#define plot layouts
+layout <- "
+A
+B
+C"
+
+#Merge plots
+diagnostics_noScale.plot = Rhat + Bulk + Tail +
+  plot_layout(design = layout) + plot_annotation(tag_levels = 'a')&
+  theme(plot.tag = element_text(face = 'bold'))
+
+#save plots as .pdf
+ggsave(diagnostics_noScale.plot , file="diagnostics_full_GU_model_noScale.pdf", path=output.dir,
+       width=6, height=6)
+
+diagnostics_noScale.plot 
+```
+
+</details>
+
+<details>
+
+<summary>No Year model</summary>
+
+```{r}
+##################################################################
+## Prepare Diagnostics — Rhat, ESS bulk, ESS tail across models ##
+##################################################################
+
+
+
+#-----------------------------------------------------------
+# 1. Flatten model diagnostics into one data frame
+#-----------------------------------------------------------
+
+diagnostics.df <- imap_dfr(model.noYear, function(ForestType_Continent_list, ForestType_Continent) {
+    extract_diagnostics(ForestType_Continent_list, ForestType_Continent = ForestType_Continent)
+  }) %>%
+  # Tidy and reorder variables
+  mutate(ForestType_Continent = factor(ForestType_Continent, levels = rev(sort(unique(ForestType_Continent)))))  # alphabetical order
+
+
+#-----------------------------------------------------------
+# 2. Summarize convergence diagnostics across models
+#-----------------------------------------------------------
+
+summary_stats <- diagnostics.df %>%
+  # Calculate summary statistics
+  summarise(
+    prop_rhat_ok = mean(max_rhat < 1.01),        # Proportion of models with Rhat < 1.01 (indicates safe convergence)
+    prop_ess_bulk_ok = mean(min_ess_bulk > 400), # Proportion of models with bulk ESS > 400 (ideal sampling in the posterior bulk)
+    prop_ess_tail_ok = mean(min_ess_tail > 400), # Proportion of models with tail ESS > 400 (ideal sampling in the posterior tails)
+    n_divergent_total = sum(n_divergent),        # Total number of divergent transitions across all models in the group
+    n_treedepth_total = sum(treedepth_exceeded), # Total number of transitions that exceeded the maximum tree depth
+    .groups = "drop" # Remove grouping structure in the resulting data frame
+  )
+
+# Display the summary statistics table
+summary_stats
+
+
+
+#################################################################
+## Visual Diagnostics — Rhat, ESS bulk, ESS tail across models ##
+#################################################################
+
+
+
+#-----------------------------------------------------------
+# Plot A: Maximum Rhat (Convergence diagnostic)
+# - Rhat < 1.01: safe convergence
+# - Rhat > 1.05: problematic convergence
+#-----------------------------------------------------------
+
+Rhat = ggplot(diagnostics.df, aes(x = ForestType_Continent, y = max_rhat)) +
+  geom_point(size = 1.5) +
+  geom_hline(yintercept = 1.01, linetype = "dashed", color = "black") +
+  geom_hline(yintercept = 1.05, linetype = "solid", color = "red") +
+  labs(
+    x = "",
+    y = "Maximum Rhat (Model convergence)",
+    color = "Model"
+  ) +
+  coord_flip() +
+  plotTheme1+
+  theme(legend.position = "top")
+
+#-----------------------------------------------------------
+# Plot B: Bulk ESS (Effective sample size for bulk of posterior)
+# - ESS < 400: potentially problematic
+# - ESS < 100: critical
+#-----------------------------------------------------------
+
+Bulk = ggplot(diagnostics.df, aes(x = ForestType_Continent, y = min_ess_bulk)) +
+  geom_point(size = 1.5) +
+  geom_hline(yintercept = 100, linetype = "solid", color = "red") +    # absolute minimum threshold
+  geom_hline(yintercept = 400, linetype = "dashed", color = "black") + # ideal minimum
+  labs(x = "", y = "Minimum Bulk ESS") +
+  coord_flip() +
+  plotTheme1
+
+#-----------------------------------------------------------
+# Plot C: Tail ESS (Effective sample size for distribution tails)
+# - Same thresholds as Bulk ESS
+#-----------------------------------------------------------
+
+Tail = ggplot(diagnostics.df, aes(x = ForestType_Continent, y = min_ess_tail)) +
+  geom_point(size = 1.5) +
+  geom_hline(yintercept = 100, linetype = "solid", color = "red") +    # critical threshold
+  geom_hline(yintercept = 400, linetype = "dashed", color = "black") + # ideal minimum
+  labs(x = "", y = "Minimum Tail ESS") +
+  coord_flip() +
+  plotTheme1
+
+#-----------------------------------------------------------
+# Merge and safe plots
+#-----------------------------------------------------------
+
+#define plot layouts
+layout <- "
+A
+B
+C"
+
+#Merge plots
+diagnostics_noYear.plot = Rhat + Bulk + Tail +
+  plot_layout(design = layout) + plot_annotation(tag_levels = 'a')&
+  theme(plot.tag = element_text(face = 'bold'))
+
+#save plots as .pdf
+ggsave(diagnostics_noYear.plot , file="diagnostics_full_GU_model_noYear.pdf", path=output.dir,
+       width=6, height=6)
+
+diagnostics_noYear.plot 
+```
+
+</details>
+
+<br>
+
+# 3. Model results - Extract posterior stats
+
+<details>
+
+<summary>No Spring model</summary>
+
+```{r, warning=FALSE}
+#-----------------------------------------------------------
+# 1. Loop through nested model list
+#-----------------------------------------------------------
+
+model.df <- purrr::imap_dfr(model.noSpring, function(model_obj, ForestType_Continent_name) {
+    if (inherits(model_obj, "brmsfit")) {
+      broom.mixed::tidy(model_obj, effects = "fixed", conf.int = TRUE, conf.level = 0.95) %>%
+        mutate(
+          ForestType_Continent = ForestType_Continent_name,
+          .before = term
+        )
+    } else {
+      NULL  # skip if not a brms model
+    }
+  }) %>% 
+  # Tidy
+  filter(!term == "(Intercept)") %>% 
+  dplyr::select(-c(component,effect)) %>% 
+  # Tidy, reorder and rename variables
+  mutate(
+    ForestType_Continent = factor(ForestType_Continent, 
+                                  levels = rev(sort(unique(ForestType_Continent)))), # alphabetical order
+    term = plyr::revalue(term, warn_missing=F,
+                         c("Greenup_prev_z"      = "Greenup",
+                           "LSF2"                = "Late frost",
+                           "Tmean.EQ1.SO1_z"     = "TQ2",
+                           "Tmean.SO1.EQ2_z"     = "TQ3",
+                           "MidGreendown_prev_z" = "Greendown",
+                           "Tmean.EQ2.SO2_z"     = "TQ4",
+                           "SWrad.GU_z"          = "Radiation",
+                           "Tmean_spring_z"      = "Temperature",
+                           "RH.GU_z"             = "Humidity")))
+
+
+#-----------------------------------------------------------
+# 2. Summarize data and create plotting helpers
+#-----------------------------------------------------------
+
+# Define consistent term order
+term.order <- c("Greenup","Late frost",
+                "TQ2","TQ3","Greendown","TQ4",
+                "Humidity","Radiation","Temperature")
+
+# Summarize data
+summary_model.df <- model.df %>%
+  group_by(term) %>%
+  summarise(
+    mean_estimate = mean(estimate, na.rm = TRUE),
+    # 100% of the individual forest types' 95% CIs fall within this range
+    lower = min(conf.low, na.rm = TRUE),
+    upper = max(conf.high,na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(term = factor(term, levels = term.order))
+
+# get the number of terms
+terms <- unique(model.df$term)
+n_terms <- length(terms)
+
+# Create numeric positions halfway between rows (used for spacing lines between terms)
+grid_lines <- seq(1.5, n_terms - 0.5, by = 1)
+
+# Define dodge & jitter
+dodge <- position_dodge(width = 0.6)
+
+
+#-----------------------------------------------------------
+# 3. Plot data
+#-----------------------------------------------------------
+
+results_noSpring.plot = ggplot(model.df, aes(x = term)) +
+  
+  # Horizontal reference line
+  geom_hline(yintercept = 0, color = "black", linetype = "dashed") +
+  
+  # Summary error bars with dashed for early, solid for late
+  geom_errorbar(data = summary_model.df,
+                aes(x = term, y = mean_estimate, ymin = lower, ymax = upper),
+                position = dodge, width = 0.3, linewidth = 0.5,
+                inherit.aes = FALSE, color = "black") +
+  
+  # Forest type-level error bars
+  geom_errorbar(aes(y = estimate, ymin = conf.low, ymax = conf.high, color = ForestType_Continent),
+                position = dodge, width = 0.5, linewidth = 0.4) +
+  
+  # Forest type-level points
+  geom_point(aes(y = estimate, color = ForestType_Continent),
+             position = dodge, size = .8) +
+  
+  scale_color_manual(values = c("#e31a1c", "#33a02c", "#1f78b4")) +
+  
+  # Flip axes and label
+  coord_flip(ylim = c(-0.66, 0.66)) +
+  xlab("") + ylab("") +
+  labs(title = "Fixed preseason model") +
+  
+  # Theme
+  plotTheme1 +
+  theme(
+    axis.text.x = element_text(angle = 0),
+    axis.text.y = element_text(face = "plain"),
+    panel.grid.major = element_blank(),
+  ) +
+  
+  # add horizontal lines at those positions
+  geom_vline(xintercept = grid_lines, linetype = "solid", color = "grey80")
+
+results_noSpring.plot
+```
+
+</details>
+
+<details>
+
+<summary>No Scale model</summary>
+
+```{r, warning=FALSE}
+#-----------------------------------------------------------
+# 1. Loop through nested model list
+#-----------------------------------------------------------
+
+model.df <- purrr::imap_dfr(model.noScale, function(model_obj, ForestType_Continent_name) {
+    if (inherits(model_obj, "brmsfit")) {
+      broom.mixed::tidy(model_obj, effects = "fixed", conf.int = TRUE, conf.level = 0.95) %>%
+        mutate(
+          ForestType_Continent = ForestType_Continent_name,
+          .before = term
+        )
+    } else {
+      NULL  # skip if not a brms model
+    }
+  }) %>% 
+  # Tidy
+  filter(!term == "(Intercept)") %>% 
+  dplyr::select(-c(component,effect)) %>% 
+  # Tidy, reorder and rename variables
+  mutate(
+    ForestType_Continent = factor(ForestType_Continent, 
+                                  levels = rev(sort(unique(ForestType_Continent)))), # alphabetical order
+    term = plyr::revalue(term, warn_missing=F,
+                         c("Greenup_prev_z_global"      = "Greenup",
+                           "LSF2"                       = "Late frost",
+                           "Tmean.EQ1.SO1_z_global"     = "TQ2",
+                           "Tmean.SO1.EQ2_z_global"     = "TQ3",
+                           "MidGreendown_prev_z_global" = "Greendown",
+                           "Tmean.EQ2.SO2_z_global"     = "TQ4",
+                           "SWrad.GU_z_global"          = "Radiation",
+                           "Tmean.GU_z_global"          = "Temperature",
+                           "RH.GU_z_global"             = "Humidity")))
+
+
+#-----------------------------------------------------------
+# 2. Summarize data and create plotting helpers
+#-----------------------------------------------------------
+
+# Define consistent term order
+term.order <- c("Greenup","Late frost",
+                "TQ2","TQ3","Greendown","TQ4",
+                "Humidity","Radiation","Temperature")
+
+# Summarize data
+summary_model.df <- model.df %>%
+  group_by(term) %>%
+  summarise(
+    mean_estimate = mean(estimate, na.rm = TRUE),
+    # 100% of the individual forest types' 95% CIs fall within this range
+    lower = min(conf.low, na.rm = TRUE),
+    upper = max(conf.high,na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(term = factor(term, levels = term.order))
+
+# get the number of terms
+terms <- unique(model.df$term)
+n_terms <- length(terms)
+
+# Create numeric positions halfway between rows (used for spacing lines between terms)
+grid_lines <- seq(1.5, n_terms - 0.5, by = 1)
+
+# Define dodge & jitter
+dodge <- position_dodge(width = 0.6)
+
+
+#-----------------------------------------------------------
+# 3. Plot data
+#-----------------------------------------------------------
+
+results_noScale.plot = ggplot(model.df, aes(x = term)) +
+  
+  # Horizontal reference line
+  geom_hline(yintercept = 0, color = "black", linetype = "dashed") +
+  
+  # Summary error bars with dashed for early, solid for late
+  geom_errorbar(data = summary_model.df,
+                aes(x = term, y = mean_estimate, ymin = lower, ymax = upper),
+                position = dodge, width = 0.3, linewidth = 0.5,
+                inherit.aes = FALSE, color = "black") +
+  
+  # Forest type-level error bars
+  geom_errorbar(aes(y = estimate, ymin = conf.low, ymax = conf.high, color = ForestType_Continent),
+                position = dodge, width = 0.5, linewidth = 0.4) +
+  
+  # Forest type-level points
+  geom_point(aes(y = estimate, color = ForestType_Continent),
+             position = dodge, size = .8) +
+  
+  scale_color_manual(values = c("#e31a1c","#33a02c","#1f78b4")) +
+  
+  # Flip axes and label
+  coord_flip(ylim = c(-0.66, 0.66)) +
+  xlab("") + ylab("") +
+  labs(title = "Uncentered predictor model") +
+  
+  # Theme
+  plotTheme1 +
+  theme(
+    legend.position = "right",
+    axis.text.x = element_text(angle = 0),
+    axis.text.y = element_text(face = "plain"),
+    panel.grid.major = element_blank(),
+  ) +
+  
+  # add horizontal lines at those positions
+  geom_vline(xintercept = grid_lines, linetype = "solid", color = "grey80")
+
+results_noScale.plot
+```
+
+</details>
+
+<details>
+
+<summary>No Year model</summary>
+
+```{r, warning=FALSE}
+#-----------------------------------------------------------
+# 1. Loop through nested model list
+#-----------------------------------------------------------
+
+model.df <- purrr::imap_dfr(model.noYear, function(model_obj, ForestType_Continent_name) {
+    if (inherits(model_obj, "brmsfit")) {
+      broom.mixed::tidy(model_obj, effects = "fixed", conf.int = TRUE, conf.level = 0.95) %>%
+        mutate(
+          ForestType_Continent = ForestType_Continent_name,
+          .before = term
+        )
+    } else {
+      NULL  # skip if not a brms model
+    }
+  }) %>% 
+  # Tidy
+  filter(!term == "(Intercept)") %>% 
+  dplyr::select(-c(component,effect)) %>% 
+  # Tidy, reorder and rename variables
+  mutate(
+    ForestType_Continent = factor(ForestType_Continent, 
+                                  levels = rev(sort(unique(ForestType_Continent)))), # alphabetical order
+    term = plyr::revalue(term, warn_missing=F,
+                         c("Greenup_prev_z"      = "Greenup",
+                           "LSF2"                = "Late frost",
+                           "Tmean.EQ1.SO1_z"     = "TQ2",
+                           "Tmean.SO1.EQ2_z"     = "TQ3",
+                           "MidGreendown_prev_z" = "Greendown",
+                           "Tmean.EQ2.SO2_z"     = "TQ4",
+                           "SWrad.GU_z"          = "Radiation",
+                           "Tmean.GU_z"          = "Temperature",
+                           "RH.GU_z"             = "Humidity")))
+
+
+#-----------------------------------------------------------
+# 2. Summarize data and create plotting helpers
+#-----------------------------------------------------------
+
+# Define consistent term order
+term.order <- c("Greenup","Late frost",
+                "TQ2","TQ3","Greendown","TQ4",
+                "Humidity","Radiation","Temperature")
+
+# Summarize data
+summary_model.df <- model.df %>%
+  group_by(term) %>%
+  summarise(
+    mean_estimate = mean(estimate, na.rm = TRUE),
+    # 100% of the individual forest types' 95% CIs fall within this range
+    lower = min(conf.low, na.rm = TRUE),
+    upper = max(conf.high,na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(term = factor(term, levels = term.order))
+
+# get the number of terms
+terms <- unique(model.df$term)
+n_terms <- length(terms)
+
+# Create numeric positions halfway between rows (used for spacing lines between terms)
+grid_lines <- seq(1.5, n_terms - 0.5, by = 1)
+
+# Define dodge & jitter
+dodge <- position_dodge(width = 0.6)
+
+
+#-----------------------------------------------------------
+# 3. Plot data
+#-----------------------------------------------------------
+
+results_noYear.plot = ggplot(model.df, aes(x = term)) +
+  
+  # Horizontal reference line
+  geom_hline(yintercept = 0, color = "black", linetype = "dashed") +
+  
+  # Summary error bars with dashed for early, solid for late
+  geom_errorbar(data = summary_model.df,
+                aes(x = term, y = mean_estimate, ymin = lower, ymax = upper),
+                position = dodge, width = 0.3, linewidth = 0.5,
+                inherit.aes = FALSE, color = "black") +
+  
+  # Forest type-level error bars
+  geom_errorbar(aes(y = estimate, ymin = conf.low, ymax = conf.high, color = ForestType_Continent),
+                position = dodge, width = 0.5, linewidth = 0.4) +
+  
+  # Forest type-level points
+  geom_point(aes(y = estimate, color = ForestType_Continent),
+             position = dodge, size = .8) +
+  
+  scale_color_manual(values = c("#e31a1c", "#33a02c", "#1f78b4")) +
+  
+  # Flip axes and label
+  coord_flip(ylim = c(-.66, .66)) +
+  xlab("") + ylab("Standardized effect (posterior mean ± 95% CI)") +
+  labs(title = "No year term model") +
+  
+  # Theme
+  plotTheme1 +
+  theme(
+    axis.text.x = element_text(angle = 0),
+    axis.text.y = element_text(face = "plain"),
+    panel.grid.major = element_blank(),
+  ) +
+  
+  # add horizontal lines at those positions
+  geom_vline(xintercept = grid_lines, linetype = "solid", color = "grey80")
+
+results_noYear.plot
+```
+
+</details>
+
+<details>
+
+<summary>Save plots</summary>
+
+```{r, warning=FALSE}
+#-------------------------------------------------------
+# Define plot layouts
+#-------------------------------------------------------
+
+layout <- "
+A
+B
+C"
+
+
+#-------------------------------------------------------
+# Merge plots
+#-------------------------------------------------------
+
+results.plot = results_noSpring.plot + results_noScale.plot + results_noYear.plot +
+  plot_layout(design = layout) + plot_annotation(tag_levels = 'a')&
+  theme(plot.tag = element_text(face = 'bold'))
+
+
+#-------------------------------------------------------
+# Save figure as .pdf
+#-------------------------------------------------------
+
+ggsave(results.plot, file="results_full_GU_model_alternate_formulations.pdf", path=output.dir,
+       width=7, height=10)
+```
+
+</details>
+
+<br>
+
+# 4. Reproducibility
+
+<details>
+
+<summary>show</summary>
+
+```{r}
+# Datetime
+Sys.time()
+
+# Session info
+sessionInfo()
+```
+
+</details>

@@ -1,0 +1,447 @@
+---
+title: "Spring phenology tier2 project"
+subtitle: "Preseason length moving window figures (PEP725 data)"
+author: "Constantin Zohner"
+date: "Last run: `r format(Sys.Date(), '%d %B %Y')`"
+
+format:
+  html:
+    toc: false
+    theme: default
+    highlight-style: haddock
+    df-print: paged
+    embed-resources: true
+
+execute:
+  #warning: false
+  message: false
+  echo: true
+  output: true
+
+always_allow_html: true
+editor: visual
+editor_options:
+  chunk_output_type: inline
+---
+
+<br>
+
+### Model names
+
+-   Tmean: Daily mean air temperature
+-   Tmax: Daily maximum air temperature
+
+<br>
+
+# 1. Setup
+
+<details>
+
+<summary>Packages</summary>
+
+```{r, message=F}
+require(tidyverse)
+require(data.table)
+require(broom)
+require(patchwork)
+require(MASS)
+require(car)
+require(lme4)
+```
+
+</details>
+
+<details>
+
+<summary>Plot theme</summary>
+
+```{r}
+plotTheme1 = theme(legend.position   = "right",
+                   legend.background = element_rect(fill=NA, linewidth=0.5, linetype="solid"),
+                   legend.text       = element_text(color="black",face = "italic"),
+                   panel.grid.major  = element_blank(),
+                   panel.grid.minor  = element_blank(),
+                   panel.background  = element_blank(),
+                   panel.border      = element_rect(colour = "black", fill=NA),
+                   axis.line         = element_line(color = "black"),
+                   axis.text         = element_text(colour = "black"),
+                   axis.text.x       = element_text(angle = 45, hjust=1),
+                   strip.background  = element_rect(fill=NA),
+                   plot.title        = element_text(face="bold"))
+
+palette_values = c('#a6cee3','#1f78b4','#b2df8a','#33a02c','#fb9a99',
+                   '#e31a1c','#fdbf6f','#ff7f00','#cab2d6','#6a3d9a')
+```
+
+</details>
+
+<details>
+
+<summary>Directories</summary>
+
+```{r}
+#-------------------------------------------------
+# Define the base directory
+#-------------------------------------------------
+
+base.dir = "/Users/goalie/Desktop/PhD/Publication_material/40_Spring_phenology_tier2/PEP725_Analysis"
+
+
+#-------------------------------------------------
+# Build specific directories from the base
+#-------------------------------------------------
+
+# PEP moving window data
+PEP.dir = file.path(base.dir, "Analysis_input/PEP_drivers_final_spring_MW/MW15/Merged_file")
+
+# Output
+output.dir = file.path(base.dir, "Analysis_output/ModelFigures/Moving_windows/Preseason_periods")
+```
+
+</details>
+
+<details>
+
+<summary>Data</summary>
+
+```{r}
+PEP.df <- fread(paste(PEP.dir, "pep_MW15_merged_final.csv", sep="/")) %>% 
+  distinct(phenology, species, s_id, MWyear, .keep_all = T) # delete duplicates
+```
+
+<br>
+
+# 2. Analysis and Figures
+
+<details>
+
+<summary>Mixed effects models</summary>
+
+```{r}
+# Define variables and phenology groups
+variables <- c("Tmean", "Tmax")
+phenologies <- unique(PEP.df$phenology)
+
+# Loop over each phenology group
+for (phen in phenologies) {
+
+  cat("\n=============================================\n")
+  cat(paste0("Phenology group: ", phen, "\n"))
+  cat("=============================================\n")
+  
+  # Subset data for current phenology
+  phen_df <- PEP.df[PEP.df$phenology == phen, ]
+  
+  # Change in end date (leaf_out_mean assumed to exist for all phenologies)
+  end_model <- lmer(leaf_out_mean ~ MWyear + (1 | timeseries) + (1 | species),
+                    data = phen_df,
+                    control = lmerControl(optimizer = "Nelder_Mead"))
+  
+  end_slope <- summary(end_model)$coefficients["MWyear", "Estimate"]
+  end_SE <- summary(end_model)$coefficients["MWyear", "Std. Error"]*2
+  cat(paste0("Change in end date = ", round(end_slope, 2), " ± ", round(end_SE, 4), " days per year\n"))
+  
+  # Loop through temperature variables
+  for (variable in variables) {
+    
+    # Length change
+    length_formula <- as.formula(paste0(variable, "_length ~ MWyear + (1 | timeseries) + (1 | species)"))
+    length_model <- lmer(length_formula, data = phen_df, control = lmerControl(optimizer = "Nelder_Mead"))
+    length_slope <- summary(length_model)$coefficients["MWyear", "Estimate"]
+    length_SE    <- summary(length_model)$coefficients["MWyear", "Std. Error"]*2
+    cat(paste0(variable, " change in length = ", round(length_slope, 2), " ± ", round(length_SE, 4), " days per year\n"))
+    
+    # Start date change
+    start_formula <- as.formula(paste0(variable, "_start ~ MWyear + (1 | timeseries) + (1 | species)"))
+    start_model <- lmer(start_formula, data = phen_df, control = lmerControl(optimizer = "Nelder_Mead"))
+    start_slope <- summary(start_model)$coefficients["MWyear", "Estimate"]
+    start_SE    <- summary(start_model)$coefficients["MWyear", "Std. Error"]*2
+    cat(paste0(variable, " change in start date = ", round(start_slope, 2), " ± ", round(start_SE, 4), " days per year\n"))
+  }
+}
+```
+
+</details>
+
+<details>
+
+<summary>Final plots</summary>
+
+```{r}
+#==========================================
+# Leaf-out observations
+#==========================================
+
+# start for loop
+for (variable in variables) {
+  
+  #------------------------------------
+  # 1. Extract data
+  #------------------------------------
+  
+  PEP_obs.df = PEP.df %>% 
+    # keep only leaf-out observations
+    filter(phenology == "leaf_out")
+    
+  #------------------------------------
+  # 2. Linear model coefficients
+  #------------------------------------
+  
+  resultsLM = PEP_obs.df %>% 
+    
+    # group by moving windows
+    group_by(MWyear) %>% 
+    
+    # get means for each moving window
+    summarise(start  = mean(get(paste0(variable, "_start"))),
+              length = mean(get(paste0(variable, "_length"))),
+              end    = mean(leaf_out_mean)) %>% 
+    
+    do({
+      
+      # run models
+      model1 = lm(start  ~ MWyear, data=.)
+      model2 = lm(length ~ MWyear, data=.)
+      model3 = lm(end    ~ MWyear, data=.)
+      
+      # merge data
+      rbind(data.frame(tidy(model1), glance(model1)),
+            data.frame(tidy(model2), glance(model2)),
+            data.frame(tidy(model3), glance(model3)))})%>%            
+    filter(!term %in% c("(Intercept)"))
+  
+  #------------------------------------
+  # 3. Create plots
+  #------------------------------------
+  
+  # Start date
+  ############
+  
+  Start = ggplot(PEP_obs.df, aes(x = MWyear, y = as.Date(get(paste0(variable, "_start")), origin = "2000-01-01"))) + 
+    # per-species mean lines 
+    stat_summary(mapping = aes(group=species, color=species), fun = mean, geom = "line") +
+    # overall mean line (thicker)
+    stat_summary(fun = mean, geom = "line", linewidth=1.5) +
+    # linear trend over all series in each facet
+    geom_smooth(method='lm', formula = y~x, se = FALSE, linetype="dashed", color="black") +
+    # palette
+    scale_color_manual(values = palette_values) +
+    # limits
+    coord_cartesian(xlim=c(1967.9,2007.1), ylim=c(as.Date('2000-01-25'),as.Date('2000-04-01')))+
+    # MW window tick labels
+    scale_x_continuous(breaks = seq(1966,2008,by=5),
+                       labels = c('','','','','','','','',''))+
+    # text annotation 
+    annotate(geom="text", x=Inf, y = as.Date(Inf, origin="1970-01-01"), vjust=1.5, hjust=1.05, 
+             label=paste0(round(resultsLM[1,]$estimate*10,1), 
+                          ' ± ', 
+                          round(resultsLM[1,]$std.error*20,1),
+                          ' days per decade, R2 = ', 
+                          round(resultsLM[1,]$r.squared,2)))+
+    
+    xlab("") + ylab('Date')+
+    theme(axis.text.x = element_text(angle = 45, hjust=1))+
+    plotTheme1
+  
+  # Preaseason length
+  ###################
+  
+  Length = ggplot(PEP_obs.df, aes(x = MWyear, y = get(paste0(variable, "_length")))) + 
+    # per-species mean lines 
+    stat_summary(mapping = aes(group=species, color=species), fun = mean, geom = "line") +
+    # overall mean line (thicker)
+    stat_summary(fun = mean, geom = "line", linewidth=1.5) +
+    # linear trend over all series in each facet
+    geom_smooth(method='lm', formula = y~x, se = FALSE, linetype="dashed", color="black") +
+    # palette
+    scale_color_manual(values = palette_values) +
+    # limits
+    coord_cartesian(xlim=c(1967.9,2007.1), ylim=c(35,80))+
+    # MW window tick labels
+    scale_x_continuous(breaks = seq(1966,2008,by=5),
+                       labels = c('','','','','','','','',''))+
+    # text annotation 
+    annotate(geom="text", x=Inf, y = as.Date(Inf, origin="1970-01-01"), vjust=1.5, hjust=1.05, 
+             label=paste0(round(resultsLM[2,]$estimate*10,1), 
+                          ' ± ', 
+                          round(resultsLM[2,]$std.error*20,1),
+                          ' days per decade, R2 = ', 
+                          round(resultsLM[2,]$r.squared,2)))+
+    
+    xlab("") + ylab('Days')+
+    plotTheme1+
+    theme(axis.text.x = element_text(angle = 45, hjust=1), 
+          legend.position   = "none")
+  
+  # End date
+  ##########
+  
+  End = ggplot(PEP_obs.df, aes(x = MWyear, y = as.Date(leaf_out_mean, origin = "2000-01-01"))) + 
+    # per-species mean lines 
+    stat_summary(mapping = aes(group=species, color=species), fun = mean, geom = "line") +
+    # overall mean line (thicker)
+    stat_summary(fun = mean, geom = "line", linewidth=1.5) +
+    # linear trend over all series in each facet
+    geom_smooth(method='lm', formula = y~x, se = FALSE, linetype="dashed", color="black") +
+    # palette
+    scale_color_manual(values = palette_values) +
+    # limits
+    coord_cartesian(xlim=c(1967.9,2007.1), ylim=c(as.Date('2000-03-19'),as.Date('2000-05-24')))+
+    # MW window tick labels
+    scale_x_continuous(breaks = seq(1966,2008, by=5),
+                       labels = c('1966-1980','1971-1985','1976-1990',
+                                  '1981-1995','1986-2000','1991-2005',
+                                  '1996-2010','2001-2015','2006-2020'))+
+    # text annotation 
+    annotate(geom="text", x=Inf, y = as.Date(Inf, origin="1970-01-01"), vjust=1.5, hjust=1.05, 
+             label=paste0(round(resultsLM[3,]$estimate*10,1), 
+                          ' ± ', 
+                          round(resultsLM[3,]$std.error*20,1),
+                          ' days per decade, R2 = ', 
+                          round(resultsLM[3,]$r.squared,2)))+
+    
+    xlab("") + ylab('Date')+
+    plotTheme1+
+    theme(axis.text.x          = element_text(angle = 45, hjust=1),
+          legend.position   = "none")
+  
+  #------------------------------------
+  # 4. Merge and save plots
+  #------------------------------------
+  
+  #define plot layout
+  layout <- "
+  A
+  B
+  C"
+  
+  #Merge plots
+  Plot = Start + Length + End + 
+    plot_layout(design = layout) + plot_annotation(tag_levels = 'a')&
+    theme(plot.tag = element_text(face = 'bold'))
+  
+  print(Plot)
+  
+  #save plots as .pdf
+  ggsave(Plot, file=paste0("Preseason_length_observations_", variable, ".pdf"), path=output.dir,
+         width=6, height=10)
+  
+}
+
+
+#==========================================
+# Start dates of observations + simulations 
+#==========================================
+
+for (variable in variables) {
+
+  #----------------------------------------------------------
+  # 1) Summarize to (phenology, MWyear) time series
+  #----------------------------------------------------------
+  
+  dat <- PEP.df %>%
+    group_by(phenology, MWyear) %>%
+    summarise(start  = mean(.data[[paste0(variable, "_start")]],  na.rm = TRUE),
+              .groups = "drop")
+
+  #----------------------------------------------------------
+  # 2) Fit models by phenology (time series within each phenology)
+  #----------------------------------------------------------
+  
+  resultsLM <- dat %>%
+    group_by(phenology) %>%
+    group_modify(~{
+      m <- lm(start  ~ MWyear, data = .x)
+      tidy(m) %>% 
+        filter(term == "MWyear") %>%
+        mutate(r.squared = glance(m)$r.squared) 
+    }) %>%
+    ungroup()
+
+  #----------------------------------------------------------
+  # 3) Build facet-aware labels
+  #----------------------------------------------------------
+  
+  phenology_levels <- c("leaf_out","leaf_out_GDD","leaf_out_GDD.chill.lo","leaf_out_GDD.chill.hi","leaf_out_GDD.chill.DL")
+  
+  # Labels for the "start" panel text (per phenology)
+ start_labs <- resultsLM %>%
+  dplyr::mutate(
+    phenology = factor(phenology, levels = phenology_levels),
+    # Label y-position (inside your coord_cartesian range)
+    y_lab = as.Date("2000-03-27"),
+    label = paste0(
+      # slope ± 95% CI (days per decade)
+      round(estimate * 10, 1), " \u00B1 ", 
+      round(1.96 * std.error * 10, 1),
+      " days per decade; R\u00B2 = ", 
+      round(r.squared, 2)
+    )
+  ) %>%
+  dplyr::select(phenology, y_lab, label)
+  
+  #----------------------------------------------------------
+  # 4) Plot
+  #----------------------------------------------------------
+
+  Start.plot <-
+    
+    PEP.df %>%
+    mutate(phenology = factor(phenology, levels = phenology_levels)) %>%
+    
+    ggplot(aes(x = MWyear,
+               y = as.Date(.data[[paste0(variable, "_start")]], origin = "2000-01-01"))) +
+    # per-species mean lines 
+    stat_summary(aes(group = species, color = species), fun = mean, geom = "line") +
+    # overall mean line (thicker)
+    stat_summary(fun = mean, geom = "line", size = 1.5) +
+    # linear trend over all series in each facet
+    geom_smooth(method = 'lm', formula = y ~ x, se = FALSE,
+                linetype = "dashed", color = "black") +
+    # palette
+    scale_color_manual(values = palette_values) +
+    # limits
+    coord_cartesian(xlim = c(1967.9, 2007.1),
+                    ylim = c(as.Date('2000-01-10'), as.Date('2000-03-25'))) +
+    # MW window tick labels
+    scale_x_continuous(breaks = seq(1966, 2008, by = 5),
+                       labels = c('1966-1980','1971-1985','1976-1990',
+                                  '1981-1995','1986-2000','1991-2005',
+                                  '1996-2010','2001-2015','2006-2020')) +
+    # facet-specific annotation (one row per phenology)
+    geom_text(data = start_labs,
+              aes(x = Inf, y = y_lab, label = label),
+              inherit.aes = FALSE, hjust = 1.05, vjust = 1.2, size = 3.5) +
+
+    xlab("") + ylab("Date") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    facet_grid(~ phenology) +
+    plotTheme1
+  
+  # Save plot
+  ggsave(Start.plot, file = paste0("Preseason_start_", variable, ".pdf"),
+         path = output.dir, width = 16, height = 4)
+
+  print(Start.plot)
+}
+```
+
+</details>
+
+<br>
+
+# 3. Reproducibility
+
+<details>
+
+<summary>show</summary>
+
+```{r}
+# Datetime
+Sys.time()
+
+# Session info
+sessionInfo()
+```
+
+</details>

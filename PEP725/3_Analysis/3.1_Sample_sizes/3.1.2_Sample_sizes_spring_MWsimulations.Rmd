@@ -1,0 +1,172 @@
+---
+title: Spring phenology tier2 project
+author: Constantin Zohner
+date: "Last run: `r format(Sys.Date(), '%d %B %Y')`"
+subtitle: Check sample sizes (PEP725 Moving windows )
+output:
+  html_document:
+    highlight: haddock
+    toc: false
+    use_bookdown: true
+    df_print: paged
+    fig_caption: yes
+---
+
+<style>
+body
+  { counter-reset: source-line 0; }
+pre.numberSource code
+  { counter-reset: none; }
+</style>
+
+<br>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  class.source = "numberLines lineAnchors"
+  )
+```
+
+<br><br>
+
+## 1. Load packages and data
+
+<details><summary>get packages</summary>
+```{r}
+require(data.table)
+require(ggplot2)
+require(tidyverse)
+```
+</details>
+
+<details><summary>get data</summary>
+```{r}
+# path
+PEP_individual.dir = "/Users/consti/Desktop/PhD/Publication_material/40_Spring_phenology_tier2/PEP725_Analysis/Analysis_input/PEP_drivers_final_spring_MW/MW15/Individual_files"
+PEP.dir            = "/Users/consti/Desktop/PhD/Publication_material/40_Spring_phenology_tier2/PEP725_Analysis/Analysis_input/PEP_drivers_final_spring_MW/MW15/Merged_file"
+
+## Import data
+PEP.df <- rbindlist(lapply(list.files(path = PEP_individual.dir), 
+                           function(n) fread(file.path(PEP_individual.dir, n))), fill = F)
+```
+</details>
+
+<br>
+
+## 2. Data cleaning
+<details><summary>show code</summary>
+```{r}
+#-----------------------------------------------------------
+# Cleaning
+#-----------------------------------------------------------
+
+PEP.df <- PEP.df %>% 
+  dplyr::select(-V1) %>% 
+  # Delete duplicates
+  distinct(timeseries, species, phenology, s_id, MWyear, year, .keep_all=T) %>% 
+  # Filter
+  group_by(timeseries, species, s_id, MWyear) %>% 
+  filter(
+    # Delete timeseries <12 years
+    n() >= 12,
+    # Delete timeseries lacking inter-annual variation in leaf-out dates
+    !leaf_out_sd==0,
+    # Delete timeseries lacking inter-annual variation in radiation
+    !(sd(SWrad.PS10)==0) ) %>%
+  ungroup()
+
+
+#-----------------------------------------------------------
+# Add leaf-out of previous year
+#-----------------------------------------------------------
+
+# Create previous year data 
+PEPprevious.df = PEP.df %>%
+  #select columns
+  dplyr::select(c(phenology, timeseries, year, MWyear, leaf_out)) %>% 
+  #match leaf-out dates of previous year to current leaf-out dates
+  mutate(year = year+1) %>% 
+  #rename leaf-out column
+  rename(leaf_out_prev = leaf_out)
+
+# Merge data
+PEP.df = left_join(PEP.df, PEPprevious.df, by = c("phenology","timeseries","year","MWyear")) 
+
+
+#-----------------------------------------------------------
+# Safe table
+#-----------------------------------------------------------
+
+write.csv(PEP.df, paste(PEP.dir, "pep_MW15_merged.csv", sep="/"))
+```
+</details>
+
+<br>
+
+## 3. Check sample sizes
+<details><summary>show code</summary>
+```{r}
+# Types of leaf-out data (observations + simulations)
+table(PEP.df$phenology)
+
+# keep only actual leaf-out data
+PEP.df = PEP.df %>% filter(phenology == "leaf_out")
+
+#total observations
+nrow(PEP.df)
+
+#how many species have data?
+length(unique(PEP.df$species))
+
+#how many sites in total?
+length(unique(PEP.df$s_id))
+
+#time span 
+range(PEP.df$year)
+hist(PEP.df$year, xlab="Year", main="Temporal distribution of data", col='lightblue', breaks=30)
+
+#Time series length
+length.timeseries = PEP.df %>%
+  group_by(timeseries, MWyear) %>%
+  summarize(timeseries.length = n())
+mean(length.timeseries$timeseries.length)
+range(length.timeseries$timeseries.length)
+
+#leaf-out data
+mean(PEP.df$leaf_out)
+sd(PEP.df$leaf_out)
+range(PEP.df$leaf_out)
+hist(PEP.df$leaf_out, xlab="Leaf-out date", main="Leaf-out gradient", col='lightblue')
+
+#Create summary dataframe
+sample.size = PEP.df %>%
+  group_by(species) %>%
+  summarize(n.time.series = length(unique(s_id)),
+            n.observations = n())
+
+#Sample sizes within species
+data.frame(sample.size)
+
+#Total amount of times series
+sum(sample.size$n.time.series)
+
+#Bar Plot 
+sample.size = reshape2::melt(sample.size, id.vars = c("species"), measure.vars = c("n.time.series","n.observations"))
+ggplot(sample.size, aes(x=species, y=value)) + 
+  geom_bar(stat = "identity")+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  facet_wrap(~variable, nrow=2, scales="free_y")
+```
+</details>
+
+<br>
+
+## 4. Reproducibility
+<details><summary>show code</summary>
+```{r}
+## date time
+Sys.time()
+
+## session info
+sessionInfo()
+```

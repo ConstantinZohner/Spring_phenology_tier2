@@ -1,0 +1,1029 @@
+---
+title: "Spring phenology tier2 project"
+subtitle: "Alternate Bayesian model figures (PEP725 data)"
+author: "Constantin Zohner"
+date: "Last run: `r format(Sys.Date(), '%d %B %Y')`"
+
+format:
+  html:
+    toc: false
+    theme: default
+    highlight-style: haddock
+    df-print: paged
+    embed-resources: true
+
+execute:
+  #warning: false
+  message: false
+  echo: true
+  output: true
+
+always_allow_html: true
+editor: visual
+editor_options:
+  chunk_output_type: inline
+---
+
+<br>
+
+### Models
+
+-   Full_noSpring: no specific preseason temperature, just mean Jan to March temperatures
+-   Full_noScale: no site-level centering (and scaling) of variables, just global scaling
+-   Full_noYear: no year term
+
+### Variable names
+
+#### Preseason
+
+##### (start and end dates vary across time series; start date = fitted; end date = time series-level mean leaf-out)
+
+-   Tmean/max: Preseason mean/maximum daily air temperature
+-   SWrad: Preseason short-wave radiation
+-   RH: Preseason relative humidity
+
+#### Fixed periods
+
+-   Tmean.EQ1.SO1: Mean daily air temperature (March equinox to summer solstice of preceding year)
+-   Tmean.SO1.EQ2: Mean daily air temperature (Summer solstice to September equinox of preceding year)
+-   Tmean.EQ2.SO2: Mean daily air temperature (September equinox to winter solstice of preceding year)
+
+#### Phenology
+
+-   leaf_out_prev: Leaf-out date of preceding year
+-   leaf_off_prev: Leaf senescence date of preceding year
+
+#### Late frosts in preceding year
+
+-   LSF2: Binary indicators of late spring frost events (\<-2°C) occurring after leaf-out in the previous year
+
+<br>
+
+# 1. Setup
+
+<details>
+
+<summary>Packages</summary>
+
+```{r, message=F}
+library(tidyverse)
+library(ggplot2)
+library(patchwork)
+library(ggpattern)
+library(brms)
+library(posterior)
+library(rstan)
+library(pracma)
+```
+
+</details>
+
+<details>
+
+<summary>Functions</summary>
+
+```{r, message=F}
+#-----------------------------------------------------------
+# Extract key convergence diagnostics from a brmsfit model
+#-----------------------------------------------------------
+
+extract_diagnostics <- function(model, period, species) {
+  draws <- as_draws_df(model)
+  diag_summary <- summarise_draws(draws)
+  data.frame(
+    period = period,
+    species = species,
+    max_rhat = max(diag_summary$rhat, na.rm = TRUE),               # Rhat convergence statistic
+    min_ess_bulk = min(diag_summary$ess_bulk, na.rm = TRUE),       # Minimum effective sample size (bulk)
+    min_ess_tail = min(diag_summary$ess_tail, na.rm = TRUE),       # Minimum effective sample size (tail)
+    n_divergent = sum(model$diagnostic_summary$divergent__),       # Total number of divergent transitions
+    treedepth_exceeded = sum(model$diagnostic_summary$treedepth__) # Total number of transitions exceeding tree depth
+  )
+}
+
+
+#-----------------------------------------------------------
+# Interpolation function
+#-----------------------------------------------------------
+
+lin_interp = function(x, y, length.out=100) {
+  approx(x, y, xout=seq(min(x), max(x), length.out=length.out))$y
+}
+```
+
+</details>
+
+<details>
+
+<summary>Plot theme</summary>
+
+```{r, message=F}
+plotTheme1 = theme(legend.position   = "none",
+                   legend.background = element_rect(fill=NA, linewidth=0.5, linetype="solid"),
+                   legend.text       = element_text(color="black"),
+                   panel.grid.major  = element_line(color = "grey90"),
+                   panel.background  = element_blank(),
+                   panel.border      = element_rect(colour = "black", fill=NA),
+                   axis.line         = element_line(color = "black"),
+                   axis.text         = element_text(colour = "black"),
+                   strip.background  = element_rect(fill=NA),
+                   strip.text        = element_text(colour = 'black', face="italic"),
+                   plot.title        = element_text(hjust = 0.5))
+```
+
+</details>
+
+<details>
+
+<summary>Directories</summary>
+
+```{r}
+#-------------------------------------------------
+# Define the base directory
+#-------------------------------------------------
+
+base.dir = "/Users/goalie/Desktop/PhD/Publication_material/40_Spring_phenology_tier2/PEP725_Analysis/Analysis_output"
+
+
+#-------------------------------------------------
+# Build specific directories from the base
+#-------------------------------------------------
+
+# Model results
+model.dir = file.path(base.dir, "ModelResults/Bayesian_models")
+
+# Figure output
+output.dir = file.path(base.dir, "ModelFigures/Bayesian_models")
+```
+
+</details>
+
+<details>
+
+<summary>Data</summary>
+
+```{r}
+#----------------------------------------------------
+# no spring preseason model
+#----------------------------------------------------
+
+model.noSpring    = readRDS(file.path(model.dir, "brms_full_models_noSpring.rds"))
+
+
+#----------------------------------------------------
+# no site-level scaling model
+#----------------------------------------------------
+
+model.noScale    = readRDS(file.path(model.dir, "brms_full_models_noScale.rds"))
+
+
+#----------------------------------------------------
+# no Year model
+#----------------------------------------------------
+
+model.noYear    = readRDS(file.path(model.dir, "brms_full_models_noYear.rds"))
+```
+
+</details>
+
+<br>
+
+# 2. Model diagnostics
+
+<details>
+
+<summary>No Spring model</summary>
+
+```{r}
+##################################################################
+## Prepare Diagnostics — Rhat, ESS bulk, ESS tail across models ##
+##################################################################
+
+
+
+#-----------------------------------------------------------
+# 1. Flatten model diagnostics into one data frame
+#-----------------------------------------------------------
+
+diagnostics.df <- imap_dfr(model.noSpring, function(period_list, period) {
+  imap_dfr(period_list, function(species_list, species) {
+    extract_diagnostics(species_list, period = period, species = species)
+  })
+}) %>%
+  # Tidy and reorder variables
+  mutate(species = factor(species, levels = rev(sort(unique(species)))))  # alphabetical order
+       
+  
+#-----------------------------------------------------------
+# 2. Summarize convergence diagnostics across models by model type and period
+#-----------------------------------------------------------
+
+summary_stats <- diagnostics.df %>%
+  # Group data by phenological period (early/late)
+  group_by(period) %>%
+  # Calculate summary statistics within each group
+  summarise(
+    prop_rhat_ok = mean(max_rhat < 1.01),        # Proportion of models with Rhat < 1.02 (indicates good convergence)
+    prop_ess_bulk_ok = mean(min_ess_bulk > 400), # Proportion of models with bulk ESS > 200 (good sampling in the posterior bulk)
+    prop_ess_tail_ok = mean(min_ess_tail > 400), # Proportion of models with tail ESS > 200 (good sampling in the posterior tails)
+    n_divergent_total = sum(n_divergent),        # Total number of divergent transitions across all models in the group
+    n_treedepth_total = sum(treedepth_exceeded), # Total number of transitions that exceeded the maximum tree depth
+    .groups = "drop" # Remove grouping structure in the resulting data frame
+  )
+
+# Display the summary statistics table
+summary_stats
+
+
+
+#################################################################
+## Visual Diagnostics — Rhat, ESS bulk, ESS tail across models ##
+#################################################################
+
+
+
+#-----------------------------------------------------------
+# Plot A: Maximum Rhat (Convergence diagnostic)
+# - Rhat < 1.01: safe convergence
+# - Rhat > 1.05: problematic convergence
+#-----------------------------------------------------------
+
+Rhat = ggplot(diagnostics.df, aes(x = species, y = max_rhat, color = period, shape = period)) +
+  geom_jitter(width = 0.2, height = 0, size = 2.5, alpha = 0.9) +
+  geom_hline(yintercept = 1.01, linetype = "dashed", color = "black") +
+  geom_hline(yintercept = 1.05, linetype = "solid", color = "red") +
+  scale_shape_manual(values = c("early" = 16, "late" = 17)) +
+  labs(
+    x = "Species",
+    y = "Maximum Rhat (Model convergence)",
+    color = "Model",
+    shape = "Period"
+  ) +
+  coord_flip() +
+  plotTheme1+
+  theme(legend.position = "top",
+        axis.text.y = element_text(face = "italic")) 
+
+#-----------------------------------------------------------
+# Plot B: Bulk ESS (Effective sample size for bulk of posterior)
+# - ESS < 400: potentially problematic
+# - ESS < 100: critical
+#-----------------------------------------------------------
+
+Bulk = ggplot(diagnostics.df, aes(x = species, y = min_ess_bulk, color = period, shape = period)) +
+  geom_jitter(width = 0.2, height = 0, size = 2.5, alpha = 0.9) +
+  geom_hline(yintercept = 100, linetype = "solid", color = "red") +    # absolute minimum threshold
+  geom_hline(yintercept = 400, linetype = "dashed", color = "black") + # ideal minimum
+  labs(x = "Species", y = "Minimum Bulk ESS") +
+  coord_flip() +
+  scale_shape_manual(values = c("early" = 16, "late" = 17)) +
+  plotTheme1 +
+  theme(axis.text.y = element_text(face = "italic"))
+
+#-----------------------------------------------------------
+# Plot C: Tail ESS (Effective sample size for distribution tails)
+# - Same thresholds as Bulk ESS
+#-----------------------------------------------------------
+
+Tail = ggplot(diagnostics.df, aes(x = species, y = min_ess_tail, color = period, shape = period)) +
+  geom_jitter(width = 0.2, height = 0, size = 2.5, alpha = 0.9) +
+  geom_hline(yintercept = 100, linetype = "solid", color = "red") +    # critical threshold
+  geom_hline(yintercept = 400, linetype = "dashed", color = "black") + # ideal minimum
+  labs(x = "Species", y = "Minimum Tail ESS") +
+  coord_flip() +
+  scale_shape_manual(values = c("early" = 16, "late" = 17)) +
+  plotTheme1 +
+  theme(axis.text.y = element_text(face = "italic"))
+
+#-----------------------------------------------------------
+# Merge and safe plots
+#-----------------------------------------------------------
+
+#define plot layouts
+layout <- "
+A
+B
+C"
+
+#Merge plots
+diagnostics_noSpring.plot = Rhat + Bulk + Tail +
+  plot_layout(design = layout) + plot_annotation(tag_levels = 'a')&
+  theme(plot.tag = element_text(face = 'bold'))
+
+#save plots as .pdf
+ggsave(diagnostics_noSpring.plot, file="diagnostics_full_model_noSpring.pdf", path=output.dir,
+       width=8, height=8)
+
+diagnostics_noSpring.plot 
+```
+
+</details>
+
+<details>
+
+<summary>No Scale model</summary>
+
+```{r}
+##################################################################
+## Prepare Diagnostics — Rhat, ESS bulk, ESS tail across models ##
+##################################################################
+
+
+
+#-----------------------------------------------------------
+# 1. Flatten model diagnostics into one data frame
+#-----------------------------------------------------------
+
+diagnostics.df <- imap_dfr(model.noScale, function(period_list, period) {
+  imap_dfr(period_list, function(species_list, species) {
+    extract_diagnostics(species_list, period = period, species = species)
+  })
+}) %>%
+  # Tidy and reorder variables
+  mutate(species = factor(species, levels = rev(sort(unique(species)))))  # alphabetical order
+         
+
+#-----------------------------------------------------------
+# 2. Summarize convergence diagnostics across models by model type and period
+#-----------------------------------------------------------
+
+summary_stats <- diagnostics.df %>%
+  # Group data by phenological period (early/late)
+  group_by(period) %>%
+  # Calculate summary statistics within each group
+  summarise(
+    prop_rhat_ok = mean(max_rhat < 1.01),        # Proportion of models with Rhat < 1.02 (indicates good convergence)
+    prop_ess_bulk_ok = mean(min_ess_bulk > 400), # Proportion of models with bulk ESS > 200 (good sampling in the posterior bulk)
+    prop_ess_tail_ok = mean(min_ess_tail > 400), # Proportion of models with tail ESS > 200 (good sampling in the posterior tails)
+    n_divergent_total = sum(n_divergent),        # Total number of divergent transitions across all models in the group
+    n_treedepth_total = sum(treedepth_exceeded), # Total number of transitions that exceeded the maximum tree depth
+    .groups = "drop" # Remove grouping structure in the resulting data frame
+  )
+
+# Display the summary statistics table
+summary_stats
+
+
+
+#################################################################
+## Visual Diagnostics — Rhat, ESS bulk, ESS tail across models ##
+#################################################################
+
+
+
+#-----------------------------------------------------------
+# Plot A: Maximum Rhat (Convergence diagnostic)
+# - Rhat < 1.01: safe convergence
+# - Rhat > 1.05: problematic convergence
+#-----------------------------------------------------------
+
+Rhat = ggplot(diagnostics.df, aes(x = species, y = max_rhat, color = period, shape = period)) +
+  geom_jitter(width = 0.2, height = 0, size = 2.5, alpha = 0.9) +
+  geom_hline(yintercept = 1.01, linetype = "dashed", color = "black") +
+  geom_hline(yintercept = 1.05, linetype = "solid", color = "red") +
+  scale_shape_manual(values = c("early" = 16, "late" = 17)) +
+  labs(
+    x = "Species",
+    y = "Maximum Rhat (Model convergence)",
+    color = "Model",
+    shape = "Period"
+  ) +
+  coord_flip() +
+  plotTheme1+
+  theme(legend.position = "top",
+        axis.text.y = element_text(face = "italic"))
+
+#-----------------------------------------------------------
+# Plot B: Bulk ESS (Effective sample size for bulk of posterior)
+# - ESS < 400: potentially problematic
+# - ESS < 100: critical
+#-----------------------------------------------------------
+
+Bulk = ggplot(diagnostics.df, aes(x = species, y = min_ess_bulk, color = period, shape = period)) +
+  geom_jitter(width = 0.2, height = 0, size = 2.5, alpha = 0.9) +
+  geom_hline(yintercept = 100, linetype = "solid", color = "red") +    # absolute minimum threshold
+  geom_hline(yintercept = 400, linetype = "dashed", color = "black") + # ideal minimum
+  labs(x = "Species", y = "Minimum Bulk ESS") +
+  coord_flip() +
+  scale_shape_manual(values = c("early" = 16, "late" = 17)) +
+  plotTheme1 +
+  theme(axis.text.y = element_text(face = "italic"))
+
+#-----------------------------------------------------------
+# Plot C: Tail ESS (Effective sample size for distribution tails)
+# - Same thresholds as Bulk ESS
+#-----------------------------------------------------------
+
+Tail = ggplot(diagnostics.df, aes(x = species, y = min_ess_tail, color = period, shape = period)) +
+  geom_jitter(width = 0.2, height = 0, size = 2.5, alpha = 0.9) +
+  geom_hline(yintercept = 100, linetype = "solid", color = "red") +    # critical threshold
+  geom_hline(yintercept = 400, linetype = "dashed", color = "black") + # ideal minimum
+  labs(x = "Species", y = "Minimum Tail ESS") +
+  coord_flip() +
+  scale_shape_manual(values = c("early" = 16, "late" = 17)) +
+  plotTheme1 +
+  theme(axis.text.y = element_text(face = "italic"))
+
+#-----------------------------------------------------------
+# Merge and safe plots
+#-----------------------------------------------------------
+
+#define plot layouts
+layout <- "
+A
+B
+C"
+
+#Merge plots
+diagnostics_noScale.plot = Rhat + Bulk + Tail +
+  plot_layout(design = layout) + plot_annotation(tag_levels = 'a')&
+  theme(plot.tag = element_text(face = 'bold'))
+
+#save plots as .pdf
+ggsave(diagnostics_noScale.plot , file="diagnostics_full_model_noScale.pdf", path=output.dir,
+       width=8, height=8)
+
+diagnostics_noScale.plot 
+```
+
+</details>
+
+<details>
+
+<summary>No Year model</summary>
+
+```{r}
+##################################################################
+## Prepare Diagnostics — Rhat, ESS bulk, ESS tail across models ##
+##################################################################
+
+
+
+#-----------------------------------------------------------
+# 1. Flatten model diagnostics into one data frame
+#-----------------------------------------------------------
+
+diagnostics.df <- imap_dfr(model.noYear, function(period_list, period) {
+  imap_dfr(period_list, function(species_list, species) {
+    extract_diagnostics(species_list, period = period, species = species)
+  })
+}) %>%
+  # Tidy and reorder variables
+  mutate(species = factor(species, levels = rev(sort(unique(species)))))  # alphabetical order
+       
+  
+#-----------------------------------------------------------
+# 2. Summarize convergence diagnostics across models by model type and period
+#-----------------------------------------------------------
+
+summary_stats <- diagnostics.df %>%
+  # Group data by phenological period (early/late)
+  group_by(period) %>%
+  # Calculate summary statistics within each group
+  summarise(
+    prop_rhat_ok = mean(max_rhat < 1.01),        # Proportion of models with Rhat < 1.02 (indicates good convergence)
+    prop_ess_bulk_ok = mean(min_ess_bulk > 400), # Proportion of models with bulk ESS > 200 (good sampling in the posterior bulk)
+    prop_ess_tail_ok = mean(min_ess_tail > 400), # Proportion of models with tail ESS > 200 (good sampling in the posterior tails)
+    n_divergent_total = sum(n_divergent),        # Total number of divergent transitions across all models in the group
+    n_treedepth_total = sum(treedepth_exceeded), # Total number of transitions that exceeded the maximum tree depth
+    .groups = "drop" # Remove grouping structure in the resulting data frame
+  )
+
+# Display the summary statistics table
+summary_stats
+
+
+
+#################################################################
+## Visual Diagnostics — Rhat, ESS bulk, ESS tail across models ##
+#################################################################
+
+
+
+#-----------------------------------------------------------
+# Plot A: Maximum Rhat (Convergence diagnostic)
+# - Rhat < 1.01: safe convergence
+# - Rhat > 1.05: problematic convergence
+#-----------------------------------------------------------
+
+Rhat = ggplot(diagnostics.df, aes(x = species, y = max_rhat, color = period, shape = period)) +
+  geom_jitter(width = 0.2, height = 0, size = 2.5, alpha = 0.9) +
+  geom_hline(yintercept = 1.01, linetype = "dashed", color = "black") +
+  geom_hline(yintercept = 1.05, linetype = "solid", color = "red") +
+  scale_shape_manual(values = c("early" = 16, "late" = 17)) +
+  labs(
+    x = "Species",
+    y = "Maximum Rhat (Model convergence)",
+    color = "Model",
+    shape = "Period"
+  ) +
+  coord_flip() +
+  plotTheme1+
+  theme(legend.position = "top",
+        axis.text.y = element_text(face = "italic")) 
+
+#-----------------------------------------------------------
+# Plot B: Bulk ESS (Effective sample size for bulk of posterior)
+# - ESS < 400: potentially problematic
+# - ESS < 100: critical
+#-----------------------------------------------------------
+
+Bulk = ggplot(diagnostics.df, aes(x = species, y = min_ess_bulk, color = period, shape = period)) +
+  geom_jitter(width = 0.2, height = 0, size = 2.5, alpha = 0.9) +
+  geom_hline(yintercept = 100, linetype = "solid", color = "red") +    # absolute minimum threshold
+  geom_hline(yintercept = 400, linetype = "dashed", color = "black") + # ideal minimum
+  labs(x = "Species", y = "Minimum Bulk ESS") +
+  coord_flip() +
+  scale_shape_manual(values = c("early" = 16, "late" = 17)) +
+  plotTheme1 +
+  theme(axis.text.y = element_text(face = "italic"))
+
+#-----------------------------------------------------------
+# Plot C: Tail ESS (Effective sample size for distribution tails)
+# - Same thresholds as Bulk ESS
+#-----------------------------------------------------------
+
+Tail = ggplot(diagnostics.df, aes(x = species, y = min_ess_tail, color = period, shape = period)) +
+  geom_jitter(width = 0.2, height = 0, size = 2.5, alpha = 0.9) +
+  geom_hline(yintercept = 100, linetype = "solid", color = "red") +    # critical threshold
+  geom_hline(yintercept = 400, linetype = "dashed", color = "black") + # ideal minimum
+  labs(x = "Species", y = "Minimum Tail ESS") +
+  coord_flip() +
+  scale_shape_manual(values = c("early" = 16, "late" = 17)) +
+  plotTheme1 +
+  theme(axis.text.y = element_text(face = "italic"))
+
+#-----------------------------------------------------------
+# Merge and safe plots
+#-----------------------------------------------------------
+
+#define plot layouts
+layout <- "
+A
+B
+C"
+
+#Merge plots
+diagnostics_noYear.plot = Rhat + Bulk + Tail +
+  plot_layout(design = layout) + plot_annotation(tag_levels = 'a')&
+  theme(plot.tag = element_text(face = 'bold'))
+
+#save plots as .pdf
+ggsave(diagnostics_noYear.plot, file="diagnostics_full_model_noYear.pdf", path=output.dir,
+       width=8, height=8)
+
+diagnostics_noYear.plot 
+```
+
+</details>
+
+<br>
+
+# 3. Model results - Extract posterior stats
+
+<details>
+
+<summary>No Spring model</summary>
+
+```{r, warning=FALSE}
+#-----------------------------------------------------------
+# 1. Loop through 2-level nested model list
+#-----------------------------------------------------------
+
+model.df <- purrr::imap_dfr(model.noSpring, function(period_list, period_name) {
+    purrr::imap_dfr(period_list, function(model_obj, species_name) {
+      if (inherits(model_obj, "brmsfit")) {
+        broom.mixed::tidy(model_obj, effects = "fixed", conf.int = TRUE, conf.level = 0.95) %>%
+          mutate(
+            period = period_name,
+            species = species_name,
+            .before = term
+          )
+      } else {
+        NULL  # skip if not a brms model
+      }
+    })
+}) %>% 
+  # Tidy
+  filter(!term == "(Intercept)") %>% 
+  dplyr::select(-c(component,effect)) %>% 
+  # Tidy, reorder and rename variables
+  mutate(
+      species = factor(species, levels = rev(sort(unique(species)))), # alphabetical order
+      term = plyr::revalue(term, warn_missing=F,
+                           c("leaf_out_prev_z"  = "Leaf-out",
+                             "LSF2"             = "Late frost",
+                             "Tmean.EQ1.SO1_z"  = "TQ2",
+                             "Tmean.SO1.EQ2_z"  = "TQ3",
+                             "leaf_off_z"       = "Leaf-off",
+                             "Tmean.EQ2.SO2_z"  = "TQ4",
+                             "RH_z"             = "Humidity",
+                             "SWrad_z"          = "Radiation",
+                             "Tmax_spring_z"    = "Tmax")))
+
+
+#-----------------------------------------------------------
+# 2. Summarize data and create plotting helpers
+#-----------------------------------------------------------
+
+# Define consistent term order
+term.order <- c("Leaf-out","Late frost",
+                "TQ2","TQ3","Leaf-off","TQ4",
+                "Humidity","Radiation","Tmax")
+
+# Summarize data
+summary_model.df <- model.df %>%
+    group_by(term, period) %>%
+    summarise(
+      mean_estimate = mean(estimate, na.rm = TRUE),
+      # 100% of the individual species' 95% CIs fall within this range
+      lower = min(conf.low, na.rm = TRUE),
+      upper = max(conf.high,na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(term = factor(term, levels = term.order))
+  
+# get the number of terms
+terms <- unique(model.df$term)
+n_terms <- length(terms)
+  
+# Create numeric positions halfway between rows (used for spacing lines between terms)
+grid_lines <- seq(1.5, n_terms - 0.5, by = 1)
+  
+# Define dodge & jitter
+dodge <- position_dodge(width = 0.6)
+point_dodge_jitter <- position_jitterdodge(
+  dodge.width = 0.6,
+  jitter.width = 0.35,
+  jitter.height = 0
+)
+
+
+#-----------------------------------------------------------
+# 3. Plot data
+#-----------------------------------------------------------
+
+results_noSpring.plot = ggplot(model.df, aes(x = term, group = period)) +
+  
+  # Horizontal reference line
+  geom_hline(yintercept = 0, color = "black", linetype = "dashed") +
+    
+  # Summary error bars with dashed for early, solid for late
+  geom_errorbar(data = summary_model.df,
+                aes(x = term, y = mean_estimate, ymin = lower, ymax = upper, linetype = period),
+                position = dodge, width = 0.3, linewidth = 0.6,
+                inherit.aes = FALSE, color = "black") +
+    
+  # Species-level error bars
+  geom_errorbar(aes(y = estimate, ymin = conf.low, ymax = conf.high, color = species),
+                position = dodge, width = 0.2, linewidth = 0.5, alpha = 0.5) +
+    
+  # Species-level points
+  geom_point(aes(y = estimate, color = species, shape = period),
+             position = point_dodge_jitter, size = 1.8, alpha = 0.7) +
+    
+  # Shape, color, linetype scales
+  scale_shape_manual(values = c("early" = 16, "late" = 17)) +
+  scale_linetype_manual(values = c("early" = "dashed", "late" = "solid")) +
+  scale_color_manual(values = c(
+    "#a6cee3", "#1f78b4", "#b2df8a", "#33a02c", "#fb9a99",
+    "#e31a1c", "#fdbf6f", "#ff7f00", "#cab2d6", "#6a3d9a"
+  )) +
+    
+  # Flip axes and label
+  coord_flip(ylim = c(-0.75, 0.75)) +
+  xlab("") + ylab("") +
+  labs(title = "Fixed preseason model") +
+  
+  # Theme
+  plotTheme1 +
+  theme(
+    axis.text.x = element_text(angle = 0),
+    axis.text.y = element_text(face = "plain"),
+    panel.grid.major = element_blank(),
+  ) +
+    
+  # Tidy legend
+  guides(color = guide_legend(override.aes = list(alpha = 1)))+
+  # add horizontal lines at those positions
+  geom_vline(xintercept = grid_lines, linetype = "solid", color = "grey80")
+  
+results_noSpring.plot
+```
+
+</details>
+
+<details>
+
+<summary>No Scale model</summary>
+
+```{r, warning=FALSE}
+#-----------------------------------------------------------
+# 1. Loop through 2-level nested model list
+#-----------------------------------------------------------
+
+model.df <- purrr::imap_dfr(model.noScale, function(period_list, period_name) {
+    purrr::imap_dfr(period_list, function(model_obj, species_name) {
+      if (inherits(model_obj, "brmsfit")) {
+        broom.mixed::tidy(model_obj, effects = "fixed", conf.int = TRUE, conf.level = 0.95) %>%
+          mutate(
+            period = period_name,
+            species = species_name,
+            .before = term
+          )
+      } else {
+        NULL  # skip if not a brms model
+      }
+    })
+}) %>% 
+  # Tidy
+  filter(!term == "(Intercept)") %>% 
+  dplyr::select(-c(component,effect)) %>% 
+  # Tidy, reorder and rename variables
+  mutate(
+      species = factor(species, levels = rev(sort(unique(species)))), # alphabetical order
+      term = plyr::revalue(term, warn_missing=F,
+                           c("leaf_out_prev_z_global"  = "Leaf-out",
+                             "LSF2"                    = "Late frost",
+                             "Tmean.EQ1.SO1_z_global"  = "TQ2",
+                             "Tmean.SO1.EQ2_z_global"  = "TQ3",
+                             "leaf_off_z_global"       = "Leaf-off",
+                             "Tmean.EQ2.SO2_z_global"  = "TQ4",
+                             "RH_z_global"             = "Humidity",
+                             "SWrad_z_global"          = "Radiation",
+                             "Tmax_z_global"           = "Tmax")))
+
+
+#-----------------------------------------------------------
+# 2. Summarize data and create plotting helpers
+#-----------------------------------------------------------
+
+# Define consistent term order
+term.order <- c("Leaf-out","Late frost",
+                "TQ2","TQ3","Leaf-off","TQ4",
+                "Humidity","Radiation","Tmax")
+  
+summary_model.df <- model.df %>%
+    group_by(term, period) %>%
+    summarise(
+      mean_estimate = mean(estimate, na.rm = TRUE),
+      # 100% of the individual species' 95% CIs fall within this range
+      lower = min(conf.low, na.rm = TRUE),
+      upper = max(conf.high,na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(term = factor(term, levels = term.order))
+  
+# First, get the number of terms
+terms <- unique(model.df$term)
+n_terms <- length(terms)
+  
+# Create numeric positions halfway between rows (used for spacing lines between terms)
+grid_lines <- seq(1.5, n_terms - 0.5, by = 1)
+  
+# Define dodge & jitter
+dodge <- position_dodge(width = 0.6)
+point_dodge_jitter <- position_jitterdodge(
+  dodge.width = 0.6,
+  jitter.width = 0.35,
+  jitter.height = 0
+)
+
+
+#-----------------------------------------------------------
+# 3. Plot data
+#-----------------------------------------------------------
+
+results_noScale.plot = ggplot(model.df, aes(x = term, group = period)) +
+  # Horizontal reference line
+  geom_hline(yintercept = 0, color = "black", linetype = "dashed") +
+    
+  # Summary error bars with dashed for early, solid for late
+  geom_errorbar(data = summary_model.df,
+                aes(x = term, y = mean_estimate, ymin = lower, ymax = upper, linetype = period),
+                position = dodge, width = 0.3, linewidth = 0.6,
+                inherit.aes = FALSE, color = "black") +
+    
+  # Species-level error bars
+  geom_errorbar(aes(y = estimate, ymin = conf.low, ymax = conf.high, color = species),
+                position = dodge, width = 0.2, linewidth = 0.5, alpha = 0.5) +
+    
+  # Species-level points
+  geom_point(aes(y = estimate, color = species, shape = period),
+             position = point_dodge_jitter, size = 1.8, alpha = 0.7) +
+    
+  # Shape, color, linetype scales
+  scale_shape_manual(values = c("early" = 16, "late" = 17)) +
+  scale_linetype_manual(values = c("early" = "dashed", "late" = "solid")) +
+  scale_color_manual(values = c(
+    "#a6cee3", "#1f78b4", "#b2df8a", "#33a02c", "#fb9a99",
+    "#e31a1c", "#fdbf6f", "#ff7f00", "#cab2d6", "#6a3d9a"
+  )) +
+    
+  # Flip axes and label
+  coord_flip(ylim = c(-0.75, 0.75)) +
+  xlab("") + ylab("") +
+  labs(title = "Uncentered predictor model") +
+
+  # Theme
+  plotTheme1 +
+  theme(
+    legend.position = "right",
+    axis.text.x = element_text(angle = 0),
+    axis.text.y = element_text(face = "plain"),
+    panel.grid.major = element_blank()
+  ) +
+    
+  # Tidy legend
+  guides(color = guide_legend(override.aes = list(alpha = 1)))+
+  # add horizontal lines at those positions
+  geom_vline(xintercept = grid_lines, linetype = "solid", color = "grey80")
+  
+results_noScale.plot
+```
+
+</details>
+
+<details>
+
+<summary>No Year model</summary>
+
+```{r, warning=FALSE}
+#-----------------------------------------------------------
+# 1. Loop through 2-level nested model list
+#-----------------------------------------------------------
+
+model.df <- purrr::imap_dfr(model.noYear, function(period_list, period_name) {
+    purrr::imap_dfr(period_list, function(model_obj, species_name) {
+      if (inherits(model_obj, "brmsfit")) {
+        broom.mixed::tidy(model_obj, effects = "fixed", conf.int = TRUE, conf.level = 0.95) %>%
+          mutate(
+            period = period_name,
+            species = species_name,
+            .before = term
+          )
+      } else {
+        NULL  # skip if not a brms model
+      }
+    })
+}) %>% 
+  # Tidy
+  filter(!term == "(Intercept)") %>% 
+  dplyr::select(-c(component,effect)) %>% 
+  # Tidy, reorder and rename variables
+  mutate(
+      species = factor(species, levels = rev(sort(unique(species)))), # alphabetical order
+      term = plyr::revalue(term, warn_missing=F,
+                           c("leaf_out_prev_z"  = "Leaf-out",
+                             "LSF2"             = "Late frost",
+                             "Tmean.EQ1.SO1_z"  = "TQ2",
+                             "Tmean.SO1.EQ2_z"  = "TQ3",
+                             "leaf_off_z"       = "Leaf-off",
+                             "Tmean.EQ2.SO2_z"  = "TQ4",
+                             "RH_z"             = "Humidity",
+                             "SWrad_z"          = "Radiation",
+                             "Tmax_z"           = "Tmax")))
+
+
+#-----------------------------------------------------------
+# 2. Summarize data and create plotting helpers
+#-----------------------------------------------------------
+
+# Define consistent term order
+term.order <- c("Leaf-out","Late frost",
+                "TQ2","TQ3","Leaf-off","TQ4",
+                "Humidity","Radiation","Tmax")
+
+# Summarize data
+summary_model.df <- model.df %>%
+    group_by(term, period) %>%
+    summarise(
+      mean_estimate = mean(estimate, na.rm = TRUE),
+      # 100% of the individual species' 95% CIs fall within this range
+      lower = min(conf.low, na.rm = TRUE),
+      upper = max(conf.high,na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(term = factor(term, levels = term.order))
+  
+# get the number of terms
+terms <- unique(model.df$term)
+n_terms <- length(terms)
+  
+# Create numeric positions halfway between rows (used for spacing lines between terms)
+grid_lines <- seq(1.5, n_terms - 0.5, by = 1)
+  
+# Define dodge & jitter
+dodge <- position_dodge(width = 0.6)
+point_dodge_jitter <- position_jitterdodge(
+  dodge.width = 0.6,
+  jitter.width = 0.35,
+  jitter.height = 0
+)
+
+
+#-----------------------------------------------------------
+# 3. Plot data
+#-----------------------------------------------------------
+
+results_noYear.plot = ggplot(model.df, aes(x = term, group = period)) +
+  
+  # Horizontal reference line
+  geom_hline(yintercept = 0, color = "black", linetype = "dashed") +
+    
+  # Summary error bars with dashed for early, solid for late
+  geom_errorbar(data = summary_model.df,
+                aes(x = term, y = mean_estimate, ymin = lower, ymax = upper, linetype = period),
+                position = dodge, width = 0.3, linewidth = 0.6,
+                inherit.aes = FALSE, color = "black") +
+    
+  # Species-level error bars
+  geom_errorbar(aes(y = estimate, ymin = conf.low, ymax = conf.high, color = species),
+                position = dodge, width = 0.2, linewidth = 0.5, alpha = 0.5) +
+    
+  # Species-level points
+  geom_point(aes(y = estimate, color = species, shape = period),
+             position = point_dodge_jitter, size = 1.8, alpha = 0.7) +
+    
+  # Shape, color, linetype scales
+  scale_shape_manual(values = c("early" = 16, "late" = 17)) +
+  scale_linetype_manual(values = c("early" = "dashed", "late" = "solid")) +
+  scale_color_manual(values = c(
+    "#a6cee3", "#1f78b4", "#b2df8a", "#33a02c", "#fb9a99",
+    "#e31a1c", "#fdbf6f", "#ff7f00", "#cab2d6", "#6a3d9a"
+  )) +
+    
+  # Flip axes and label
+  coord_flip(ylim = c(-.75, .75)) +
+  xlab("") + ylab("Standardized effect (posterior mean ± 95% CI)") +
+  labs(title = "No year term model") +
+  
+  # Theme
+  plotTheme1 +
+  theme(
+    axis.text.x = element_text(angle = 0),
+    axis.text.y = element_text(face = "plain"),
+    panel.grid.major = element_blank(),
+  ) +
+    
+  # Tidy legend
+  guides(color = guide_legend(override.aes = list(alpha = 1)))+
+  # add horizontal lines at those positions
+  geom_vline(xintercept = grid_lines, linetype = "solid", color = "grey80")
+  
+results_noYear.plot
+```
+
+</details>
+
+<details>
+
+<summary>Save plots</summary>
+
+```{r, warning=FALSE}
+#-------------------------------------------------------
+# Define plot layouts
+#-------------------------------------------------------
+
+layout <- "
+A
+B
+C"
+
+
+#-------------------------------------------------------
+# Merge plots
+#-------------------------------------------------------
+
+results.plot = results_noSpring.plot + results_noScale.plot + results_noYear.plot +
+  plot_layout(design = layout) + plot_annotation(tag_levels = 'a')&
+  theme(plot.tag = element_text(face = 'bold'))
+
+
+#-------------------------------------------------------
+# Save figure as .pdf
+#-------------------------------------------------------
+
+ggsave(results.plot, file="results_full_model_alternate_formulations.pdf", path=output.dir,
+       width=7, height=10)
+```
+
+</details>
+
+<br>
+
+# 4. Reproducibility
+
+<details>
+
+<summary>show</summary>
+
+```{r}
+# Datetime
+Sys.time()
+
+# Session info
+sessionInfo()
+```
+
+</details>

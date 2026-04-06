@@ -1,0 +1,237 @@
+---
+title: "Spring phenology tier2 project"
+author: "Constantin Zohner"
+date: "Last run: `r format(Sys.Date(), '%d %B %Y')`"
+subtitle: "Run moving-window models (PEP725 data)"
+
+format:
+  html:
+    toc: false
+    theme: default
+    highlight-style: haddock
+    df-print: paged
+    embed-resources: true
+
+execute:
+  warning: false
+  message: false
+  echo: true
+  output: true
+
+always_allow_html: true
+editor: visual
+editor_options:
+  chunk_output_type: inline
+---
+
+<br>
+
+### **Driver names**
+
+-   Tmax: Daily maximum air temperature
+
+-   Tmax_log (log-transformed)
+
+-   Tmax_z (z-scaled)
+
+<br>
+
+# 1. Setup
+
+<details>
+
+<summary>Packages</summary>
+
+```{r}
+require(tidyverse)
+require(data.table)
+require(broom)
+require(pbmcapply)
+```
+
+</details>
+
+<details>
+
+<summary>Directories</summary>
+
+```{r}
+#-------------------------------------------------------
+# Define the base directory
+#-------------------------------------------------------
+
+base.dir <- "/Users/goalie/Desktop/PhD/Publication_material/40_Spring_phenology_tier2/PEP725_Analysis"
+
+
+#-------------------------------------------------------
+# Build specific directories from the base
+#-------------------------------------------------------
+
+PEP_MW.dir    <- file.path(base.dir, "Analysis_input/PEP_drivers_final_spring_MW/MW15/Merged_file")
+output.dir <- file.path(base.dir, "Analysis_output/ModelResults/Moving_window_analysis/Individual_files_models")
+```
+
+</details>
+
+<details>
+
+<summary>Data</summary>
+
+```{r}
+# Moving window data: read the merged MW15 dataset from disk
+MW.df <- fread(file.path(PEP_MW.dir, "pep_MW15_merged_final.csv")) %>% 
+  
+  # Keep only the columns needed for the moving-window regressions and transforms
+  dplyr::select(phenology, species, timeseries, MWyear, alt_dem,
+                leaf_out, Tmax)
+
+# -------------------------------------------------------------------
+# Global shift for log-transforming temperature
+# -------------------------------------------------------------------
+# Goal: avoid undefined log(T) when Tmax <= 0, while keeping the transform
+# monotonic and *time-invariant* (same shift everywhere).
+#
+# We add a single constant so that (Tmax + shift) is always > 0:
+# shift = |min(Tmax)| + 0.01  -> ensures the minimum becomes +0.01.
+shift <- abs(min(MW.df$Tmax, na.rm = TRUE)) + 0.01
+
+# print the shift value to the console for reproducibility
+shift
+
+MW.df = MW.df %>% 
+  
+  # Group at the moving-window time-series level.
+  # This ensures the filters and scaling are applied within each MW window × site × species.
+  group_by(phenology, species, timeseries, MWyear, alt_dem) %>%  
+  
+  # Remove groups that are not informative for regression:
+  filter(
+    # Exclude windows where leaf-out has too little variation (slope estimates unstable / meaningless)
+    sd(leaf_out, na.rm=T) > 1, 
+    
+    # Exclude windows with no temperature variability (slope undefined; SD_x = 0)
+    sd(Tmax, na.rm=T) > 0) %>% 
+  
+  # Create transformed predictors/response used in the different model variants
+  mutate(
+    # Log-transform leaf-out (paired with log(T) in St_log to linearize first-hitting scaling)
+    leaf_out_log = log(leaf_out),
+    
+    # Log-transform temperature after applying a global shift (avoids clipping artefacts)
+    Tmax_log = log(Tmax+shift),
+    
+    # Z-score logged temperature within each MW group (removes variance-driven scaling in X)
+    Tmax_z_log = as.numeric(scale(Tmax_log))
+   ) %>% 
+   ungroup() 
+```
+
+</details>
+
+<br>
+
+# 2. Analysis
+
+<details>
+
+<summary>Show</summary>
+
+```{r}
+#-------------------------------------------------------
+# 1. Create equations
+#-------------------------------------------------------
+
+equation.list <- list(
+  St_abs   = formula("leaf_out     ~ Tmax"),      # absoluate (days per °C)
+  St_log   = formula("leaf_out_log ~ Tmax_log"),  # log-log transformed (log y and x)
+  St_z     = formula("leaf_out_log ~ Tmax_z_log") # log y, additionally scale log x
+)
+
+# Equation identifiers
+equation.names <- names(equation.list)
+
+
+#-------------------------------------------------------
+# 2. Loop through equations
+#-------------------------------------------------------
+
+parallelCalc <- function(equation.name){ 
+  
+  equation <- equation.list[[equation.name]]
+  
+  ModelResults.df <- MW.df %>%
+    group_by(phenology, species, timeseries, MWyear, alt_dem) %>%  
+    do({
+      df <- .
+      model.linear <- lm(equation, data = df)
+
+      # extract y and x from the model frame (handles transforms in formula)
+      mf <- model.frame(model.linear)
+      y  <- mf[[1]]
+      x  <- mf[[2]]
+
+      # variance components
+      SD_y <- sd(y, na.rm = TRUE)
+      SD_x <- sd(x, na.rm = TRUE)
+      var_ratio <- SD_y / SD_x
+      
+      # means
+      Mean_y <- mean(y, na.rm = TRUE)
+      Mean_x <- mean(x, na.rm = TRUE)
+
+      # simple correlation (robust to NAs)
+      ok <- is.finite(x) & is.finite(y)
+      r_xy <- if (sum(ok) >= 3 && SD_x > 0 && SD_y > 0) {
+        cor(x[ok], y[ok], use = "complete.obs")
+      } else {
+        NA_real_
+      }
+
+      tidy(model.linear) %>%
+        dplyr::filter(term != "(Intercept)") %>% 
+        dplyr::mutate(
+          equation  = equation.name,
+          sd_y      = SD_y,
+          sd_x      = SD_x,
+          var_ratio = var_ratio,
+          mean_y    = Mean_y,
+          mean_x    = Mean_x,
+          cor_xy    = r_xy
+        )
+    }) %>%
+    ungroup()
+  
+  write.table(
+    ModelResults.df,
+    file = paste0(output.dir, "/", equation.name, ".csv"),
+    sep = ",", row.names = FALSE, col.names = TRUE
+  )
+}
+
+
+#-------------------------------------------------------
+# 3. Run parallel code
+#-------------------------------------------------------
+
+outputlist <- pbmclapply(equation.names, parallelCalc, mc.cores = 3, mc.preschedule = FALSE)
+```
+
+</details>
+
+<br>
+
+# 3. Reproducibility
+
+<details>
+
+<summary>Show</summary>
+
+```{r}
+## datetime
+Sys.time()
+
+## session info
+sessionInfo()
+```
+
+</details>

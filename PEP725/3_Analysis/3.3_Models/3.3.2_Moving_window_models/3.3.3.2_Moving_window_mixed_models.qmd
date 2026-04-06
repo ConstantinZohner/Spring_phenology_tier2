@@ -1,0 +1,187 @@
+---
+title: "Spring phenology tier2 project"
+author: "Constantin Zohner"
+date: "Last run: `r format(Sys.Date(), '%d %B %Y')`"
+subtitle: "Run mixed moving-window models (PEP725 data)"
+
+format:
+  html:
+    toc: false
+    theme: default
+    highlight-style: haddock
+    df-print: paged
+    embed-resources: true
+
+execute:
+  warning: false
+  message: false
+  echo: true
+  output: true
+
+always_allow_html: true
+editor: visual
+editor_options:
+  chunk_output_type: inline
+---
+
+<br>
+
+### **Driver names**
+
+-   Tmean: Daily mean air temperature
+-   Tmax: Daily maximum air temperature
+-   SWrad: Short-wave radiation
+-   leaf_out_prev: prior-year leaf-out
+
+<br>
+
+# 1. Setup
+
+<details>
+
+<summary>Packages</summary>
+
+```{r}
+require(tidyverse)
+require(data.table)
+require(broom)
+require(pbmcapply)
+require(lme4)
+```
+
+</details>
+
+<details>
+
+<summary>Directories</summary>
+
+```{r}
+# Define the base directory
+base.dir <- "/Users/goalie/Desktop/PhD/Publication_material/40_Spring_phenology_tier2/PEP725_Analysis"
+
+# Build specific directories from the base
+PEP_MW.dir    <- file.path(base.dir, "Analysis_input/PEP_drivers_final_spring_MW/MW15/Merged_file")
+PEP.dir <- file.path(base.dir, "Analysis_input/PEP_drivers_final_spring/Merged_file")
+output.dir <- file.path(base.dir, "Analysis_output/ModelResults/Moving_window_analysis/Individual_files_mixed_models")
+```
+
+</details>
+
+<details>
+
+<summary>Data</summary>
+
+```{r}
+#-------------------------------------------------------
+# 1. Moving window data
+#-------------------------------------------------------
+
+MW.df <- fread(paste(PEP_MW.dir, "pep_MW15_merged_final.csv", sep="/")) %>% 
+  # delete time series with too little variation in leaf-out dates (leaf-out SD ≤ 1)
+  group_by(phenology, species, timeseries, MWyear, alt_dem) %>%  
+  filter(sd(leaf_out)>1) %>% 
+  ungroup()
+
+
+#-------------------------------------------------------
+# 2. PEP data
+#-------------------------------------------------------
+
+PEP.df <- fread(paste(PEP.dir, "pep_drivers_spring_data_clean.csv", sep="/")) %>% 
+  dplyr::select(c(
+    # Identifiers
+    s_id, year,
+    # Temperature
+    Tmean.EQ2.SO2)) %>% 
+  #delete duplicates
+  distinct(s_id, year, .keep_all=T)
+
+
+#-------------------------------------------------------
+# 3. Merge Moving window and PEP data
+#-------------------------------------------------------
+
+scaled_vars = c("year", "leaf_out", "leaf_out_prev", 
+                "Tmean.EQ2.SO2","Tmax","SWrad")
+
+MW.df = MW.df %>% 
+  left_join(., PEP.df, by = join_by(s_id, year)) %>% 
+ 
+  group_by(phenology, species, timeseries, MWyear, alt_dem) %>%  
+  
+  # remove time series with no variation in leaf-out of previous year
+  filter(!sd(leaf_out_prev, na.rm=T)==0,
+         !sd(Tmean.EQ2.SO2, na.rm=T)==0 ) %>% 
+  
+  # scale variables within time series
+  mutate(across(all_of(scaled_vars), ~ as.numeric(scale(.x, center = T, scale = T)))) %>% 
+  
+  ungroup()
+
+rm(PEP.df)
+```
+
+</details>
+
+<br>
+
+# 2. Analysis
+
+<details>
+
+<summary>Show</summary>
+
+```{r}
+#-------------------------------------------------------
+# 1. Create equation
+#-------------------------------------------------------
+
+equation = formula("leaf_out ~ leaf_out_prev + Tmean.EQ2.SO2 + Tmax + SWrad + (year || timeseries)")
+
+
+#-------------------------------------------------------
+# 2. Run model 
+#-------------------------------------------------------
+
+# Process the data and run the models
+ModelResults.df = MW.df %>%
+  # group data
+  group_by(phenology, species, MWyear) %>%  
+    
+  # run models
+  do({
+        model = lmer(equation, data=., REML = TRUE)
+        
+        broom.mixed::tidy(model, effects = "fixed") %>%
+          filter(effect == "fixed",
+                 term != "(Intercept)") 
+    } ) %>%
+    ungroup()
+  
+
+#-------------------------------------------------------
+# 2. Save the table  
+#-------------------------------------------------------
+
+write.table(ModelResults.df, file=paste0(output.dir, '/', 'Mixed_model.csv'), sep=',', row.names = F, col.names = T)
+```
+
+</details>
+
+<br>
+
+# 3. Reproducibility
+
+<details>
+
+<summary>Show</summary>
+
+```{r}
+## datetime
+Sys.time()
+
+## session info
+sessionInfo()
+```
+
+</details>

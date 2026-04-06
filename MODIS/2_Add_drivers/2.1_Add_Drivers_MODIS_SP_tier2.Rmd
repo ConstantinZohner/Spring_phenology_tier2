@@ -1,0 +1,536 @@
+---
+title: Spring phenology tier2 project
+author: Constantin Zohner
+date: "Last run: `r format(Sys.Date(), '%d %B %Y')`"
+
+subtitle: R code generating the MODIS drivers
+output:
+  html_document:
+    highlight: haddock
+    toc: false
+    use_bookdown: true
+    df_print: paged
+---
+
+<style>
+body
+  { counter-reset: source-line 0; }
+pre.numberSource code
+  { counter-reset: none; }
+</style>
+
+<br>
+
+### Driver names
+- Tmean: Mean daily temperature
+- Tmin: Minimum daily temperature
+- Tmax: Maximum daily temperature
+- SWrad: Net short-wave radiation
+- RH: Relative humidity
+- LSF: Late frost (-2°C or -4°C) occurrence in previous year 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  class.source = "numberLines lineAnchors"
+  )
+```
+
+<br><br>
+
+## 1. Readme, load packages and data
+<details><summary>Readme</summary>
+```{r, message=F, warning=F,  attr.source='.numberLines'}
+################################################################################
+# Climate Driver Extraction for MODIS Phenology Time Series
+#
+# Description:
+# This script extracts and summarizes daily climate variables from GLDAS data
+# for MODIS-derived phenological events (e.g. green-up) across forest sites.
+# The result is a site-year table of seasonal, monthly, and preseason climate
+# drivers associated with spring phenology timing.
+#
+# Input Data:
+# - MODIS phenology data (Greenup, MidGreenup, etc.) from MODIS_data_clean.csv
+# - Daily climate data (Tmean, Tmin, Tmax, Precip, Qair, SWrad) from GLDAS
+# - Daily photoperiod data (DL) from external photoperiod model
+#
+# Climate variables used:
+# - Tmean: Daily mean temperature (°C)
+# - Tmin: Daily minimum temperature (°C)
+# - Tmax: Daily maximum temperature (°C)
+# - Prcp: Daily precipitation (mm/day)
+# - Qair: Specific humidity (converted to RH)
+# - RH: Relative humidity (derived)
+# - SWrad: Shortwave radiation (W/m²)
+# - DL: Daylength (photoperiod, hours)
+#
+# Outputs:
+# - CSV: MODIS_drivers_spring_data.csv
+#     A site-year table of all extracted and derived variables
+#
+# Output Variables Include:
+# - Preseason means (Tmean.PS.GU10, ..., Tmean.PS.GU120, etc.)
+# - Frost event flags (LSF2, LSF4)
+# - Seasonal means by solstice and equinox intervals
+# - Monthly climate averages (Tmean.1, ..., RH.18)
+#
+# Parallelization:
+# - Script is parallelized using pbmclapply over all unique site-year time series
+# - Cores: 12 (adjust as needed)
+#
+# Error Handling:
+# - Failed site-years are caught via tryCatch and logged as RDS files for debugging
+#
+# Author: Constantin Zohner
+# Institute: Crowther Lab, ETH Zürich
+# Date created: 9 June 2025
+#
+# Required R packages: data.table, dplyr, purrr, pbmcapply, zoo, ggplot2
+#
+# Usage:
+# 1. Define input and output paths
+# 2. Ensure GLDAS and MODIS data are cleaned and formatted correctly
+# 3. Run the script end-to-end or adapt specific components
+################################################################################
+```
+
+</details>
+
+<details><summary>Packages</summary>
+```{r, message=F, warning=F,  attr.source='.numberLines'}
+library(data.table)
+library(tidyverse)
+library(purrr)
+library(pbmcapply)
+library(ggplot2)
+```
+</details>
+
+<details><summary>Helper functions</summary>
+```{r}
+#-------------------------------------------------------------
+# Convert specific to relative humidity
+#-------------------------------------------------------------
+
+qair2rh <- function(qair, temp, press = 1013.25) {
+  es <- 6.112 * exp((17.67 * temp)/(temp + 243.5))
+  e <- qair * press / (0.378 * qair + 0.622)
+  rh <- e / es
+  rh[rh > 1] <- 1
+  rh[rh < 0] <- 0
+  return(rh)
+}
+```
+</details>
+
+<details><summary>Load and prepare data</summary>
+```{r}
+################
+# Define Paths #
+################
+
+
+
+base.dir <- "/Users/consti/Desktop/PhD/Publication_material/40_Spring_phenology_tier2/MODIS_Analysis"
+
+
+# 1. Input
+##########
+
+
+#Climate
+GLDAS.dir <- file.path(base.dir, "Analysis_input/GLDAS_data")
+
+#Photoperiod
+photo.dir <- file.path(base.dir, "Analysis_input/Photoperiod")
+
+#Phenology
+MODIS.dir <- file.path(base.dir, "MODIS_data")
+
+
+# 2. Output
+###########
+
+
+MODIS_drivers.dir <- file.path(base.dir, "/Analysis_input/MODIS_drivers")
+Missing.dir       <- file.path(base.dir, "/Analysis_input/MODIS_drivers/Missing_observations")
+error_log.dir     <- file.path(base.dir, "/Analysis_input/MODIS_drivers/Error_logs")
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+###########################
+# Import and prepate data #
+###########################
+
+
+#-------------------------------------------------------------
+# Phenology data
+#-------------------------------------------------------------
+
+MODIS.df <- fread(file.path(MODIS.dir, "MODIS_data_clean.csv")) %>%
+  group_by(s_id) %>%
+  mutate(
+    # unique pixel-year identifier
+    site_year = paste0(s_id,"_",year),
+    # Calculate pixel-level mean greenup dates
+    Greenup_mean = round(mean(Greenup)),
+    MidGreenup_mean = round(mean(MidGreenup))) %>%
+  ungroup()
+
+
+#-------------------------------------------------------------
+# Photoperiod
+#-------------------------------------------------------------
+
+photo.df <- fread(file.path(photo.dir, "Photoperiod.csv"))
+
+
+#-------------------------------------------------------------
+# Import daily climatic datasets from GLDAS
+#-------------------------------------------------------------
+
+# Load core climate variables from files
+list.files(GLDAS.dir)
+vn <- c(
+  "Daily_Mean_Data_Tair_f_inst_red.csv", # daily mean temperature 
+  "Daily_Min_Data_Tair_f_inst_red.csv",  # daily minimum temperature
+  "Daily_Max_Data_Tair_f_inst_red.csv",  # daily maximum temperature
+  "Daily_Data_Rainf_f_tavg_red.csv",     # daily precipitation sum 
+  "Daily_Data_Qair_f_inst_red.csv",      # daily mean specific humidity 
+  "Daily_Data_Swnet_tavg_red.csv"        # global radiation
+)  
+# not used: 
+# "Daily_Data_SoilMoi10_40cm_inst_red.csv" (soil moisture)
+
+# Read into named list
+DataList <- lapply(file.path(GLDAS.dir, vn), fread)
+
+
+#-------------------------------------------------------------
+# Merge data and add names to list
+#-------------------------------------------------------------
+
+# Add additional datasets
+DataList[[length(DataList) + 1]] <- photo.df
+DataList[[length(DataList) + 1]] <- MODIS.df
+
+# Set all names
+names(DataList) = c(vn, "photoperiod", "MODIS")
+names(DataList)
+```
+</details>
+
+<br>
+
+## 2. Parallel computing
+<details><summary>Create loop</summary>
+```{r}
+###########################################################
+# Loop through each observations using parallel computing #
+###########################################################
+
+
+
+# Define time series by unique site-year combinations
+timeseries_year <- unique(MODIS.df$site_year)
+
+# Parallel processing function
+parallelCalc <- function(timeseries_years, DataList) {
+ 
+  #-------------------------------------------------------------
+  # extract MODIS data per site x year combination
+  #-------------------------------------------------------------
+  
+  pheno.sub <- DataList[["MODIS"]][DataList[["MODIS"]]$site_year == timeseries_years, ]
+  # Skip if doesn't exist
+  if (nrow(pheno.sub) == 0) return(NULL)
+  
+  
+  #-------------------------------------------------------------
+  # Define the length of the period of interest in calendar units
+  #-------------------------------------------------------------
+  
+  year1 <- as.character(pheno.sub$year - 1)
+  year2 <- as.character(pheno.sub$year)
+  start_doy <- paste0(year1, "-01-01")
+  end_doy <- paste0(year2, "-06-30")
+  days <- seq(as.Date(start_doy), as.Date(end_doy), by = "days")
+  
+  #get number of days in year 1 and year 2
+  days_year1 <- length(seq(as.Date(start_doy), as.Date(paste0(year1, "-12-31")), by = "days"))
+  days_year2 <- length(seq(as.Date(paste0(year2, "-01-01")), as.Date(end_doy), by = "days"))
+  
+  
+  #-------------------------------------------------------------
+  # Load and merge all climate variables
+  #-------------------------------------------------------------
+  
+  tryCatch({
+    
+    # Function to load climate data
+    get_subdata <- function(index, var_index) {
+      # Year 1
+      sub1 <- DataList[[var_index]][DataList[[var_index]]$lat == pheno.sub$lat &
+                                      DataList[[var_index]]$lon == pheno.sub$lon &
+                                      DataList[[var_index]]$year == year1, as.character(1:days_year1), with = FALSE]
+      # Year 2
+      sub2 <- DataList[[var_index]][DataList[[var_index]]$site_year == pheno.sub$site_year, as.character(1:days_year2), with = FALSE]
+      if (nrow(sub1) == 0 || nrow(sub2) == 0) return(NULL)
+      cbind(sub1, sub2)
+    }
+    
+    # ------------------------------------------------------------------------
+    # Short Name        ; Long Name                               ; Unit [d-1]
+    # ------------------------------------------------------------------------
+    # SWRAD             ; Net short wave radiation flux           ; W m-2
+    # PRCP              ; Precipitation rate                      ; mm d-1
+    # Qair              ; Specific humidity                       ; kg kg-1
+    # TMIN              ; Minimum Air Temperature                 ; degC
+    # TMEAN             ; Mean Air Temperature                    ; degC
+    # TMAX              ; Maximum Air Temperature                 ; degC
+    # ------------------------------------------------------------------------
+    
+    Tmean <- get_subdata(pheno.sub, 1)
+    Tmin  <- get_subdata(pheno.sub, 2)
+    Tmax  <- get_subdata(pheno.sub, 3)
+    Prcp  <- get_subdata(pheno.sub, 4)
+    Qair  <- get_subdata(pheno.sub, 5)
+    SWrad <- get_subdata(pheno.sub, 6)
+    DL    <- cbind(
+      DataList[["photoperiod"]][DataList[["photoperiod"]]$lat == pheno.sub$lat, as.character(1:days_year1), with = FALSE][1],
+      DataList[["photoperiod"]][DataList[["photoperiod"]]$lat == pheno.sub$lat, as.character(1:days_year2), with = FALSE][1]
+    )
+    
+    if (any(sapply(list(Tmean, Tmin, Tmax, Prcp, Qair, SWrad, DL), is.null))) {
+      write.table(pheno.sub,
+                  file = file.path(Missing.dir, paste0(timeseries_years, ".csv")),
+                  sep = ",", row.names = FALSE, col.names = TRUE)
+      return(NULL)
+    }
+
+    
+    #-------------------------------------------------------------
+    # Table of climate variables
+    #-------------------------------------------------------------
+    
+    daily_vals <- data.frame(
+      Year  = lubridate::year(days),
+      Month = lubridate::month(days),
+      Day   = lubridate::day(days),
+      DOY   = 1:length(days),
+      Tmin  = as.numeric(Tmin),
+      Tmean = as.numeric(Tmean),
+      Tmax  = as.numeric(Tmax),
+      SWrad = as.numeric(SWrad),
+      Prcp  = as.numeric(Prcp),
+      Qair  = as.numeric(Qair),
+      DL    = as.numeric(DL)
+    ) %>%
+      # Add relative humidity (%)
+      mutate(RH = qair2rh(Qair, Tmean) * 100) %>% 
+      dplyr::select(-c(Qair))
+     
+    
+    #-------------------------------------------------------------
+    # Generate sub-dataframe to store results
+    #-------------------------------------------------------------
+    
+    factors.sub <- pheno.sub %>% dplyr::select(s_id, year, lat, lon, Biome, LC, ForestType,
+                                        Greenup,Greenup_mean, 
+                                        MidGreenup,MidGreenup_mean,
+                                        Greenup_prev,MidGreenup_prev,MidGreendown_prev)
+    
+    
+    ##############################################################################################################################################
+    
+    
+    #-------------------------------------------------------------
+    # Get key dates
+    #-------------------------------------------------------------
+    
+    # Leaf-out date of previous year
+    Greenup_prev_DOY = pheno.sub$Greenup_prev
+    
+    # Row of mean Greenup and MidGreenup date
+    Greenup_mean_DOY = days_year1 + pheno.sub$Greenup_mean
+    MidGreenup_mean_DOY = days_year1 + pheno.sub$MidGreenup_mean  
+    
+    # Longest and shortest day of previous year
+    solstice1    = which(daily_vals$DL==max(daily_vals$DL))[1] 
+    solstice2    = solstice1 + which.min(daily_vals$DL[(solstice1 + 1):nrow(daily_vals)])
+    
+    # March & Septmeber equinox of previous year
+    equinox1     = solstice1 - 93       
+    equinox2     = solstice2 - 90      
+    
+    # May 1 + Sep 30 of previous year (Growing season as in Lei Chen's paper)
+    May1         = which(daily_vals$Day==1 & daily_vals$Month==5 & daily_vals$Year==year1)
+    Sep30        = which(daily_vals$Day==30 & daily_vals$Month==9 & daily_vals$Year==year1)      
+    
+    # July 15 (Late frost threshold date)
+    Jul15        = which(daily_vals$Day==15 & daily_vals$Month==7 & daily_vals$Year==year1)
+    
+    
+    ##############################################################################################################################################
+    
+    
+    #-------------------------------------------------------------
+    # Late spring frost in previous year
+    #-------------------------------------------------------------
+    
+    
+    # was there a frost event below -2°C from leaf-out until July 15?
+    #-------------------------------------------------------------
+    factors.sub$LSF2 = ifelse(any(daily_vals$Tmin[Greenup_prev_DOY:Jul15] < -2, na.rm=T), 1, 0)
+    
+    # was there a frost event below -4°C from leaf-out until July 15?
+    #-------------------------------------------------------------
+    factors.sub$LSF4 = ifelse(any(daily_vals$Tmin[Greenup_prev_DOY:Jul15] < -4, na.rm=T), 1, 0)
+    
+
+    ##############################################################################################################################################
+    
+    
+    #-------------------------------------------------------------
+    # Seasonal drivers
+    #-------------------------------------------------------------
+    
+    
+    #define variables
+    variable.names <- c("Tmin", "Tmean", "Tmax", "SWrad", "Prcp", "RH")
+    for (i in 1:length(variable.names)) {
+      variable <- daily_vals[, variable.names[i]]
+      # EQ1...March equinox previous year
+      # SO1...Summer solstice (~22 June)
+      # EQ2...September equinox previous year
+      # SO2...Winter solstice (~22 Dec)
+      # GS...period from May 1 to September 30
+      factors.sub[[paste0(variable.names[i], ".GS")]] <- mean(variable[May1:Sep30])
+      factors.sub[[paste0(variable.names[i], ".EQ1.SO1")]] <- mean(variable[equinox1:solstice1])
+      factors.sub[[paste0(variable.names[i], ".SO1.EQ2")]] <- mean(variable[solstice1:equinox2])
+      factors.sub[[paste0(variable.names[i], ".EQ2.SO2")]] <- mean(variable[equinox2:solstice2])
+    }
+    
+    
+    ##############################################################################################################################################
+    
+    
+    #----------------------------------------------------------------------------
+    # Monthly climate means: assign months 1–12 (year1) and 13–18 (year2 Jan–Jun)
+    #----------------------------------------------------------------------------
+    
+    
+    # Filter to relevant months
+    monthly_vals <- daily_vals %>%
+      filter((Year == as.integer(year1) & Month %in% 1:12) |
+               (Year == as.integer(year2) & Month %in% 1:6)) %>%
+      mutate(month_index = ifelse(Year == as.integer(year1), Month, Month + 12))
+    
+    # Loop over variables and compute per-month means
+    for (var in c("Tmin", "Tmean", "Tmax", "SWrad", "RH")) {
+      
+      # Monthly mean for this variable
+      var_monthly <- monthly_vals %>%
+        group_by(month_index) %>%
+        summarise(mean_val = mean(.data[[var]], na.rm = TRUE)) %>%
+        complete(month_index = 1:18, fill = list(mean_val = NA)) %>%
+        arrange(month_index)
+      
+      # Add as columns
+      col_names <- paste0(var, ".", 1:18)
+      values <- as.list(setNames(var_monthly$mean_val, col_names))
+      factors.sub <- bind_cols(factors.sub, as_tibble_row(values))
+    }
+    
+    
+    ##############################################################################################################################################
+    
+    
+    #-------------------------------------------------------------
+    # Preseason means for each climate driver
+    #-------------------------------------------------------------
+    
+    
+    #get preseason length vector (10 to 120 days with 10-day steps)
+    preseason.lengths = seq(10, 120, 10)
+    
+    
+    #-------------------------------------------------------------
+    # Calculate preseason means before Greenup
+    #-------------------------------------------------------------
+    
+    for (len in preseason.lengths) {
+      if ((Greenup_mean_DOY - len) >= 1) {
+        idx <- (Greenup_mean_DOY - len):Greenup_mean_DOY
+        factors.sub[[paste0("Tmean.PS.GU", len)]] <- mean(daily_vals$Tmean[idx], na.rm = TRUE)
+        factors.sub[[paste0("Tmax.PS.GU", len)]]  <- mean(daily_vals$Tmax[idx],  na.rm = TRUE)
+        factors.sub[[paste0("Tmin.PS.GU", len)]]  <- mean(daily_vals$Tmin[idx],  na.rm = TRUE)
+        factors.sub[[paste0("SWrad.PS.GU", len)]] <- mean(daily_vals$SWrad[idx], na.rm = TRUE)
+        factors.sub[[paste0("RH.PS.GU", len)]]    <- mean(daily_vals$RH[idx],    na.rm = TRUE)
+        }
+      }
+    
+    #-------------------------------------------------------------
+    # Calculate preseason means before MidGreenup
+    #-------------------------------------------------------------
+    
+    for (len in preseason.lengths) {
+      if ((MidGreenup_mean_DOY - len) >= 1) {
+        idx <- (MidGreenup_mean_DOY - len):MidGreenup_mean_DOY
+        factors.sub[[paste0("Tmean.PS.MG", len)]] <- mean(daily_vals$Tmean[idx], na.rm = TRUE)
+        factors.sub[[paste0("Tmax.PS.MG", len)]]  <- mean(daily_vals$Tmax[idx],  na.rm = TRUE)
+        factors.sub[[paste0("Tmin.PS.MG", len)]]  <- mean(daily_vals$Tmin[idx],  na.rm = TRUE)
+        factors.sub[[paste0("SWrad.PS.MG", len)]] <- mean(daily_vals$SWrad[idx], na.rm = TRUE)
+        factors.sub[[paste0("RH.PS.MG", len)]]    <- mean(daily_vals$RH[idx],    na.rm = TRUE)
+      }
+    }
+    
+    
+    ##############################################################################################################################################
+    
+    
+    return(factors.sub)
+    
+  }, error = function(e) {
+    saveRDS(list(pheno = pheno.sub, error = e$message),
+            file = file.path(error_log.dir, paste0("error_", timeseries_years, ".rds")))
+    return(NULL)
+  })
+}
+```
+</details>
+
+<details><summary>Run loop and safe data</summary>
+```{r}
+#-------------------------------------------------------------
+# Run in parallel
+#-------------------------------------------------------------
+
+outputlist <- pbmclapply(timeseries_year, function(y) parallelCalc(y, DataList), mc.cores = 12, mc.preschedule = T)
+climate.factors.df <- rbindlist(outputlist, fill = TRUE)
+
+
+#-------------------------------------------------------------
+# Save results
+#-------------------------------------------------------------
+
+write.csv(climate.factors.df, file.path(MODIS_drivers.dir, "MODIS_drivers_spring_data.csv"))
+```
+</details>
+
+<br>
+
+## 3. Reproducibility
+<details><summary>show code</summary>
+```{r}
+## date time
+Sys.time()
+
+## session info
+sessionInfo()
+```

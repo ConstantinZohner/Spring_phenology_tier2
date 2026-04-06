@@ -1,0 +1,638 @@
+---
+title: Spring phenology tier2 project
+author: Constantin Zohner
+date: "last updated 10 February 2025"
+
+subtitle: Format and clean PEP725 data
+output:
+  html_document:
+    highlight: haddock
+    toc: false
+    use_bookdown: true
+    df_print: paged
+    fig_caption: yes
+---
+
+<style>
+body
+  { counter-reset: source-line 0; }
+pre.numberSource code
+  { counter-reset: none; }
+</style>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  class.source = "numberLines lineAnchors"
+  )
+```
+
+<br><br>
+
+## 1. Load packages and set directories
+
+<details><summary>get packages</summary>
+```{r, mesage=F, warning=F}
+require(devtools)
+require(data.table)
+require(reshape2)
+require(dplyr)
+require(ggplot2)
+require(data.table)
+require(maps)
+require(lubridate)
+```
+</details>
+
+<details><summary>set directories</summary>
+```{r}
+# paths
+PEPcsv_path = "/Users/consti/Desktop/PhD/Publication_material/40_Spring_phenology_tier2/PEP725_Analysis/PEP_data"
+figure_path = "/Users/consti/Desktop/PhD/Publication_material/40_Spring_phenology_tier2/PEP725_Analysis/Analysis_output/LocationMaps"
+```
+</details>
+
+<br>
+
+## 2. Load and merge PEP data	and extract coordinates
+
+<details><summary>show code</summary>
+```{r}
+#merge PEP files into one csv
+pep_data_old = list.files(path = "/Users/consti/Desktop/PhD/Data/PEP725/PEP725_2024/PEP725_Dump1775-1979_20241108",
+                      pattern = "*.csv",
+                      full.names = TRUE) %>% 
+  purrr::map_df(~fread(.))
+
+pep_data_new = list.files(path = "/Users/consti/Desktop/PhD/Data/PEP725/PEP725_2024/PEP725_Dump1980-2024_20241108",
+                      pattern = "*.csv",
+                      full.names = TRUE) %>% 
+  purrr::map_df(~fread(.))
+
+pep_data = rbind(pep_data_old, pep_data_new)
+```
+</details>
+
+<br>
+
+## 3. Format and clean PEP data
+
+<details><summary>show code</summary>
+```{r}
+###################################################################################################
+# Apply PEP725 quality filters, delete duplicates and keep only leaf-out observations for non-crops
+###################################################################################################
+
+
+tidy_pep_data = pep_data %>%
+  
+  # delete duplicates
+  distinct(s_id, genus, species, phase_id, year, .keep_all = T) %>% 
+  
+  filter(
+    
+    # delete observations for which years don't match the phenology date
+    year == year(date),
+    
+    
+    # Plant growing phase, 0-99 corresponds to the BBCH scale, above corresponds to additional stages.
+    # The complete list you can find below and at http://www.pep725.eu/pep725_phase.php
+    
+    phase_id %in% c("10","11","223","205"),
+    
+    #--------------------------------------------------------------------------------------------------------------------------------
+    # phase_id  ; bbch  ; description
+    #--------------------------------------------------------------------------------------------------------------------------------
+    # 10        ; 10    ; G: First true leaf emerged from coleoptile, D, M: Cotyledons completely unfolded, P: First leaves separated
+    # 11        ; 11    ; First true leaf, leaf pair or whorl unfolded, P: First leaves unfolded
+    # 223       ;       ; Leaf unfolding (>=50%)
+    # 205       ;       ; autumnal colouration >=50%
+    #--------------------------------------------------------------------------------------------------------------------------------
+    
+    
+    #Season of cultivation:
+    cult_season == 0,
+    
+    #------------------------------------------------
+    # cult_season ; description
+    #------------------------------------------------
+    # 0           ; not applicable
+    # 1           ; summer cereals - sowing in spring
+    # 2           ; winter cereals - sowing in autumn
+    #------------------------------------------------
+    
+    
+    # Observation affected due to to frost, pest, ... in development http://www.pep725.eu/pep725_affected.php
+    affected_flag == 0,
+    
+    #-----------------------------------------------------------------
+    # affected_flag ; explanation
+    #-----------------------------------------------------------------
+    # 0	            ; observation not affected or impairment not known
+    # 1             ; phase belongs to next pheno season
+    # 10            ; impaired, reason unknown
+    # 11            ; impaired by pest/disease
+    # 15            ; impaired by climate extreme
+    # 16            ; impaired by late frost
+    # 17            ; impaired by drought
+    #-----------------------------------------------------------------
+    
+    
+    # PEP725 quality measure - in development
+    qc_flag %in% c(0,1), 
+    
+    #---------------------------------------
+    # qc_flag ; explanation
+    #---------------------------------------
+    # 0       ; default
+    # 1       ; not an outlier
+    # 9       ; outlier
+    #---------------------------------------
+    
+    
+    # Original quality measures provided by the partner
+    # in development http://www.pep725.eu/pep725_qc_ori.php
+    !qc_ori_flag %in% c(1801002))
+
+#----------------------------------------------------------------------------------------------------------------------------------------
+# qc_ori_flag ; original code ; explanation
+#----------------------------------------------------------------------------------------------------------------------------------------
+# 101000      ; 0             ; default
+# 101001      ; 1             ; corrected
+# 101002      ; 2             ; interpolated
+# 101003      ; 3             ; pests - leaf discolouration and leaf fall start earlier due to pests (Camereria ohridella Deshke & Dimic)
+# 101004      ; 101           ; completeness check
+# 101005      ; 102           ; plausibility check
+# 101006      ; 103           ; time consistency check
+# 101007      ; 104           ; spatial consistency check
+# 101008      ; 105           ; climatological check
+# 1801000     ; NULL          ; Not tested
+# 1801001     ; 0             ; Not an outlier
+# 1801002     ; 1             ; Outlier
+#----------------------------------------------------------------------------------------------------------------------------------------
+
+
+#check how many observations were deleted by filters and PEP725 quality flags
+paste0(nrow(pep_data) - nrow(tidy_pep_data), " (", 
+       round((1 - nrow(tidy_pep_data) / nrow(pep_data)) *100, 1), 
+       "%) observations deleted by internal PEP725 filters and quality flags")
+
+
+#############################
+# Data wrangling of full data
+#############################
+
+
+#reshape table to short format (each bbch gets separate column)
+tidy_pep_data = dcast(tidy_pep_data, s_id+year+genus+species+lat+lon+alt+alt_dem ~ phase_id, value.var = "day") %>% 
+  
+   #filter species
+    filter(!species %in% c(
+      #Crops
+      "Zea mays", 
+      "Beta vulgaris", 
+      "Vitis vinifera", 
+      "Solanum tuberosum",
+      #species with no sufficient timeseries coverage
+      "Sorbus aucuparia",
+      "Tilia cordata",
+      "Tilia platyphyllos")) %>% 
+  
+  mutate(
+    
+    #rename species
+    across('species', \(x) stringr::str_replace(x, "Ribes uva-crispa L.", "Ribes uva-crispa")),
+    
+    #add timeseries identifier
+    timeseries = paste0(s_id, "_", species)) %>%
+  
+  #rename bbch columns
+  rename(leaf_out10 = "10", leaf_out11 = "11", leaf_out223 = "223", leaf_off = "205") %>%
+  
+  #group by species and site
+  group_by(timeseries) %>% 
+  
+  #create leaf-out column: which is the most common bbch within each time series?
+  mutate(bbch = ifelse(sum(!is.na(leaf_out11)) >= sum(!is.na(leaf_out10)) & sum(!is.na(leaf_out11)) >= sum(!is.na(leaf_out223)), 11, 
+                       ifelse(sum(!is.na(leaf_out10)) >= sum(!is.na(leaf_out223)), 10, 223)),
+         leaf_out = ifelse(bbch==11, leaf_out11, 
+                           ifelse(bbch==10, leaf_out10, leaf_out223))) %>% 
+  ungroup() %>% 
+  
+  #delete columns
+  dplyr::select(-c(leaf_out10, leaf_out11, leaf_out223)) %>% 
+  
+  # delete duplicates
+  distinct(timeseries, species, year, .keep_all = T) 
+
+
+##############################################
+# Data wrangling and cleaning of leaf-out data
+##############################################
+
+
+# Table operations
+##################
+
+tidy_pep_data_leaf_out = tidy_pep_data %>%
+  
+  # remove leaf-off column
+  dplyr::select(-c(leaf_off)) %>% 
+  
+  #Data cleaning
+  filter(
+    #delete NAs
+    !is.na(leaf_out),
+    
+    #delete years before 1950
+    year>1949, 
+    
+    #delete leaf-out dates after June 21
+    leaf_out < 180) %>% 
+  
+  #delete dates deviating from median more than 3.5 times MAD
+  group_by(timeseries) %>% 
+  filter(abs(leaf_out-median(leaf_out, na.rm=T)) <= 3.5*mad(leaf_out, na.rm=T)) %>% 
+  ungroup()
+
+
+# Add leaf-out of previous year
+###############################
+
+tidy_pep_data_previous = tidy_pep_data_leaf_out %>%
+  
+  #select columns
+  dplyr::select(c(timeseries, year, leaf_out)) %>% 
+  
+  #match leaf-out dates of previous year to current leaf-out dates
+  mutate(year = year+1) %>% 
+  
+  #rename leaf-out column
+  rename(leaf_out_prev = leaf_out)
+
+
+# Merge data
+############
+
+tidy_pep_data_leaf_out = inner_join(tidy_pep_data_leaf_out, tidy_pep_data_previous,
+                                    by = c("timeseries","year")) 
+
+
+#check how many observations were deleted by leaf-out filters
+paste0(nrow(tidy_pep_data) - nrow(tidy_pep_data_leaf_out), " (", 
+       round((1 - nrow(tidy_pep_data_leaf_out) / nrow(tidy_pep_data)) *100, 1), 
+       "%) observations deleted by leaf-out filters")
+
+
+######################################################################
+# Data wrangling and cleaning of reduced data including leaf-off dates
+######################################################################
+
+
+# Data cleaning
+tidy_pep_data_leaf_off = tidy_pep_data %>%
+  
+  # remove leaf-out column
+  dplyr::select(-c(leaf_out)) %>% 
+  
+  # delete rows with no leaf-off observations
+  filter(!is.na(leaf_off)) %>% 
+  
+  #group by timeseries
+  group_by(timeseries) %>% 
+  
+  #delete leaf-off dates deviating from median more than 3.5 times MAD
+  filter(!(abs(leaf_off-median(leaf_off, na.rm=T)) > 3.5*mad(leaf_off, na.rm=T))) %>% 
+  
+  #add standard deviation
+  mutate(leaf_off_sd = sd(leaf_off, na.rm=T)) %>% 
+  
+  #delete timeseries with zero leaf-off variation
+  filter(leaf_off_sd>0) %>% 
+
+  ungroup() %>% 
+  
+  #match leaf-off dates of previous year to leaf-out dates
+  mutate(year = year+1)
+
+
+#check how many observations were deleted by leaf-off filters
+paste0(nrow(tidy_pep_data) - nrow(tidy_pep_data_leaf_off), " (", 
+       round((1 - nrow(tidy_pep_data_leaf_off) / nrow(tidy_pep_data)) *100, 1), 
+       "%) observations deleted by leaf-off filters")
+
+
+##############
+# Merge tables
+##############
+
+
+tidy_pep_data = left_join(tidy_pep_data_leaf_out, tidy_pep_data_leaf_off,
+                          by = c("s_id", "year", "genus", "species", "timeseries", "lat", "lon", "alt", "alt_dem", "bbch")) %>% 
+  
+  
+  # delete time series with fewer than 20 years of leaf-out observations
+  group_by(timeseries) %>% 
+  filter(n() >= 20) %>%
+  
+  mutate(
+    #set leaf-off dates for timeseries <20 years to NA
+    n.years.reduced = sum(!is.na(leaf_off)),
+    leaf_off        = ifelse(n.years.reduced < 20, NA, leaf_off),
+    
+    #add leaf-out standard deviation
+    leaf_out_sd = sd(leaf_out, na.rm=T)) %>% 
+  
+  #delete timeseries with zero leaf-out variation
+  filter(leaf_out_sd>0) %>% 
+  
+  ungroup() %>% 
+  
+  # Keep only data for species with more than 500 timeseries
+  group_by(species) %>%
+  filter(n_distinct(s_id) >= 500) %>% 
+  ungroup() %>% 
+  
+  # Add info
+  group_by(timeseries) %>% 
+  mutate(
+    #Add number of years per timeseries for full and reduced data
+    n.years         = sum(!is.na(leaf_out)),
+    n.years.reduced = sum(!is.na(leaf_off)),
+    
+    #add mean leaf-out date
+    leaf_out_mean = round(mean(leaf_out, na.rm=T))) %>% 
+  ungroup()
+```
+</details>
+
+<br>
+
+## 4. Sample sizes
+
+<details><summary>Full data</summary>
+```{r}
+#total observations
+nrow(tidy_pep_data)
+
+#check observed phenophases
+barplot(table(tidy_pep_data$bbch), las=2)
+table(tidy_pep_data$bbch, tidy_pep_data$species)
+
+#how many species have data?
+length(unique(tidy_pep_data$species))
+
+#how many sites in total?
+length(unique(tidy_pep_data$s_id))
+
+#time span 
+range(tidy_pep_data$year)
+paste0("Minimum timeseries length = ",   min(tidy_pep_data$n.years),
+       "; Maximum timeseries length = ", max(tidy_pep_data$n.years))
+hist(tidy_pep_data$n.years, xlab="Number of years", main="Time series length", breaks = 100)
+hist(tidy_pep_data$year, xlab="Year", main="Temporal distribution of data", breaks = 100)
+
+#latitudinal and longitudinal gradients
+range(tidy_pep_data$lon)
+range(tidy_pep_data$lat)
+hist(tidy_pep_data$lon, xlab="Longitude", main="Longitudinal gradient", breaks = 100)
+hist(tidy_pep_data$lat, xlab="Latitude", main="Latitudinal gradient", breaks = 100)
+
+#elevation gradient 
+range(tidy_pep_data$alt_dem)
+hist(tidy_pep_data$alt_dem, xlab="Elevation (m)", main="Elevational gradient", breaks = 100)
+
+#leaf-out data
+mean(tidy_pep_data$leaf_out)
+sd(tidy_pep_data$leaf_out)
+range(tidy_pep_data$leaf_out)
+hist(tidy_pep_data$leaf_out, xlab="Leaf-out date", main="Leaf-out gradient", breaks = 100)
+mean(tidy_pep_data$leaf_out_sd)
+range(tidy_pep_data$leaf_out_sd)
+hist(tidy_pep_data$leaf_out_sd, xlab="Standard deviation", main="Intra-site leaf-out variation", breaks = 100)
+
+#Create summary dataframe
+sample.size = tidy_pep_data %>%
+  group_by(species) %>%
+  summarize(n.time.series  = length(unique(s_id)),
+            n.observations = n(),
+            leaf_out_sd    = mean(leaf_out_sd))
+
+#Sample sizes within species
+data.frame(sample.size)
+
+#Total amount of times series
+sum(sample.size$n.time.series)
+
+#Bar Plot 
+sample.size = melt(sample.size, id.vars = c("species"), measure.vars = c("n.time.series","n.observations"))
+ggplot(sample.size, aes(x=species, y=value)) + 
+  geom_bar(stat = "identity")+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  facet_wrap(~variable, nrow=2, scales="free_y")
+
+# Temporal coverage per species
+tidy_pep_data %>%
+  ggplot(aes(x=year)) +
+  geom_histogram(position = 'identity', binwidth=1) +
+  facet_wrap(~species, ncol=4) +
+  theme_classic()
+
+
+#Location maps
+###############
+
+#Create map
+mp <- NULL
+mapWorld <- borders("world", colour="gray80", fill="gray80") # create a layer of borders
+mp <- ggplot() + mapWorld
+
+#Layer all stations on top
+mp_all <- mp + geom_point(data=tidy_pep_data[!duplicated(tidy_pep_data[ , c("lat", "lon")]), ], 
+                          aes(x=lon, y=lat) ,color="blue", size=.3, alpha = 0.5, shape = 16) +
+  coord_cartesian(ylim = c(min(tidy_pep_data$lat), max(tidy_pep_data$lat)), 
+                  xlim = c(min(tidy_pep_data$lon), max(tidy_pep_data$lon))) +
+  xlab("Longitude") + ylab("Latitude")+
+  theme_classic()
+
+#save plot as .pdf
+ggsave(mp_all, file="AllLocations.pdf", path=figure_path,
+       width=5, height=4)
+
+mp_all
+
+#Layer all stations for each species on top
+mp_species <- mp + geom_point(data=tidy_pep_data[!duplicated(tidy_pep_data[ , c("lat", "lon", "species")]), ], 
+                              aes(x=lon, y=lat) ,color="blue", size=.2, alpha = 0.5, shape=16) +
+  coord_cartesian(ylim = c(min(tidy_pep_data$lat), max(tidy_pep_data$lat)), 
+                  xlim = c(min(tidy_pep_data$lon), max(tidy_pep_data$lon))) +
+  xlab("Longitude") + ylab("Latitude") +
+  facet_wrap(~species, ncol=4) +
+  theme_classic()
+
+#save plot as .pdf
+ggsave(mp_species, file="SpeciesLocations.pdf", path=figure_path,
+       width=10, height=11)
+
+mp_species
+```
+</details>
+
+<details><summary>Reduced data</summary>
+```{r}
+tidy_pep_data_reduced = tidy_pep_data %>% filter(!is.na(leaf_off))
+
+#total observations
+nrow(tidy_pep_data_reduced)
+
+#check observed phenophases
+barplot(table(tidy_pep_data_reduced$bbch), las=2)
+table(tidy_pep_data_reduced$bbch, tidy_pep_data_reduced$species)
+
+#how many species have data?
+length(unique(tidy_pep_data_reduced$species))
+
+#how many sites in total?
+length(unique(tidy_pep_data_reduced$s_id))
+
+#time span 
+range(tidy_pep_data_reduced$year)
+paste0("Minimum timeseries length = ",   min(tidy_pep_data_reduced$n.years.reduced, na.rm = T),
+       "; Maximum timeseries length = ", max(tidy_pep_data_reduced$n.years.reduced, na.rm = T))
+hist(tidy_pep_data_reduced$n.years.reduced, xlab="Number of years", main="Time series length", breaks = 100)
+hist(tidy_pep_data_reduced$year, xlab="Year", main="Temporal distribution of data", breaks = 100)
+
+#latitudinal and longitudinal gradients
+range(tidy_pep_data_reduced$lon)
+range(tidy_pep_data_reduced$lat)
+hist(tidy_pep_data_reduced$lon, xlab="Longitude", main="Longitudinal gradient", breaks = 100)
+hist(tidy_pep_data_reduced$lat, xlab="Latitude", main="Latitudinal gradient", breaks = 100)
+
+#elevation gradient 
+range(tidy_pep_data_reduced$alt_dem)
+hist(tidy_pep_data_reduced$alt_dem, xlab="Elevation (m)", main="Elevational gradient", breaks = 100)
+
+#leaf-out data
+mean(tidy_pep_data$leaf_out)
+sd(tidy_pep_data$leaf_out)
+range(tidy_pep_data$leaf_out)
+hist(tidy_pep_data$leaf_out, xlab="Leaf-out date", main="Leaf-out gradient", breaks = 100)
+
+#leaf-off data
+mean(tidy_pep_data$leaf_off, na.rm=T)
+sd(tidy_pep_data$leaf_off, na.rm=T)
+range(tidy_pep_data$leaf_off, na.rm=T)
+hist(tidy_pep_data$leaf_off, xlab="Leaf-off date", main="Leaf-off gradient", breaks = 100)
+mean(tidy_pep_data_reduced$leaf_off_sd, na.rm=T)
+range(tidy_pep_data_reduced$leaf_off_sd, na.rm=T)
+hist(tidy_pep_data_reduced$leaf_off_sd, xlab="Standard deviation", main="Intra-site leaf-off variation", breaks = 100)
+
+#Create summary dataframe
+sample.size = tidy_pep_data_reduced %>%
+  group_by(species) %>%
+  summarize(n.time.series = length(unique(s_id)),
+            n.observations = n(),
+            leaf_off_sd    = mean(leaf_off_sd))
+
+#Sample sizes within species
+data.frame(sample.size)
+
+#Total amount of times series
+sum(sample.size$n.time.series)
+
+#Bar Plot 
+sample.size = melt(sample.size, id.vars = c("species"), measure.vars = c("n.time.series","n.observations"))
+ggplot(sample.size, aes(x=species, y=value)) + 
+  geom_bar(stat = "identity")+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  facet_wrap(~variable, nrow=2, scales="free_y")
+
+# Temporal coverage per species
+tidy_pep_data_reduced %>%
+  ggplot(aes(x=year)) +
+  geom_histogram(position = 'identity', binwidth=1) +
+  facet_wrap(~species, ncol=5) +
+  theme_classic()
+
+
+#Location maps
+###############
+
+#Create map
+mp <- NULL
+mapWorld <- borders("world", colour="gray80", fill="gray80") # create a layer of borders
+mp <- ggplot() + mapWorld
+
+#Layer all stations on top
+mp_all <- mp + geom_point(data=tidy_pep_data_reduced[!duplicated(tidy_pep_data_reduced[ , c("lat", "lon")]), ], 
+                          aes(x=lon, y=lat) ,color="blue", size=.3, alpha = 0.5, shape = 16) +
+  coord_cartesian(ylim = c(min(tidy_pep_data_reduced$lat), max(tidy_pep_data_reduced$lat)), 
+                  xlim = c(min(tidy_pep_data_reduced$lon), max(tidy_pep_data_reduced$lon))) +
+  xlab("Longitude") + ylab("Latitude") +
+  theme_classic()
+
+#save plot as .pdf
+ggsave(mp_all, file="AllLocations_reduced.pdf", path=figure_path,
+       width=5, height=4)
+
+mp_all
+
+#Layer all stations for each species on top
+mp_species <- mp + geom_point(data=tidy_pep_data_reduced[!duplicated(tidy_pep_data_reduced[ , c("lat", "lon", "species")]), ], 
+                              aes(x=lon, y=lat) ,color="blue", size=.2, alpha = 0.5, shape=16) +
+  coord_cartesian(ylim = c(min(tidy_pep_data_reduced$lat), max(tidy_pep_data_reduced$lat)), 
+                  xlim = c(min(tidy_pep_data_reduced$lon), max(tidy_pep_data_reduced$lon))) +
+  xlab("Longitude") + ylab("Latitude") +
+  facet_wrap(~species, ncol=2) +
+  theme_classic()
+
+#save plot as .pdf
+ggsave(mp_species, file="SpeciesLocations_reduced.pdf", path=figure_path,
+       width=5, height=7.5)
+
+mp_species
+```
+</details>
+
+<br>
+
+## 5. Safe final tables
+
+<details><summary>show code</summary>
+```{r}
+# Order table
+tidy_pep_data = tidy_pep_data %>% 
+  # select and order columns
+  dplyr::select(c(timeseries, s_id, genus, species, year, lat, lon, alt, alt_dem, bbch, leaf_out, leaf_out_prev, leaf_out_mean, leaf_out_sd, leaf_off, n.years, n.years.reduced)) %>% 
+  # order rows by species, site id and year
+  arrange(species, s_id, year)
+
+tidy_pep_data %>% 
+  filter(timeseries=="1_Fagus sylvatica")
+
+# Safe table
+write.csv(tidy_pep_data, paste(PEPcsv_path, "PEP725_data_clean.csv", sep="/"))  
+
+#extract unique coordinates
+pep_data_coordinates = tidy_pep_data %>% 
+  distinct(s_id, lat, lon, .keep_all = F) %>% 
+  arrange(s_id)
+
+#safe coordinates table
+write.csv(pep_data_coordinates, paste(PEPcsv_path, "PEP725_coordinates.csv", sep="/"))  
+```
+</details>
+
+<br>
+
+## 6. Reproducibility 
+
+<details><summary>show code</summary>
+```{r}
+## datetime
+Sys.time()
+
+
+## session info
+sessionInfo()
+```
+</details>

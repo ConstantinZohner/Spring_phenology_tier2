@@ -1,0 +1,337 @@
+---
+title: "Spring phenology tier2 project"
+subtitle: "R code extracting the species-specific spring climate (PEP725 data)"
+author: "Constantin Zohner"
+date: "Last run: `r format(Sys.Date(), '%d %B %Y')`"
+
+format:
+  html:
+    toc: false
+    theme: default
+    highlight-style: haddock
+    df-print: paged
+    embed-resources: true
+
+execute:
+  #warning: false
+  message: false
+  echo: true
+  output: true
+
+always_allow_html: true
+editor: visual
+editor_options:
+  chunk_output_type: inline
+---
+
+<br>
+
+### Driver names
+
+-   Tmean: Mean daily temperature
+-   Tmin: Minimum daily temperature
+-   Tmax: Maximum daily temperature
+
+<br>
+
+### Species names
+
+-   Deciduous trees: Aesculus hippocastanum, Alnus glutinosa, Betula pendula, Fagus sylvatica, Fraxinus excelsior, Quercus robur
+-   Deciduous shrub: Ribes uva-crispa
+-   Deciduous needleleaf: Larix decidua
+-   Evergreen needleleaf: Picea abies, Pinus sylvestris
+
+<br>
+
+# 1. Setup
+
+<details>
+
+<summary>Packages</summary>
+
+```{r}
+require(data.table)
+require(dplyr)
+require(pbmcapply)
+```
+
+</details>
+
+<details>
+
+<summary>Directories</summary>
+
+```{r}
+#-------------------------------------------------
+# Define the base directory
+#-------------------------------------------------
+
+base.dir <- "/Users/goalie/Desktop/PhD/Publication_material/40_Spring_phenology_tier2/PEP725_Analysis"
+
+
+#-------------------------------------------------
+# Build specific directories from the base
+#-------------------------------------------------
+
+# Climate
+EOBS.dir = file.path(base.dir, "Analysis_input/EOBS_data")
+
+# Phenology
+PEP.dir = file.path(base.dir, "PEP_data")
+
+# Output
+output.dir = file.path(base.dir, "Analysis_input/Spring_climate")
+```
+
+</details>
+
+<details>
+
+<summary>Data</summary>
+
+```{r}
+#-------------------------------------------------
+# Phenology data
+#-------------------------------------------------
+
+PEP.df = fread(paste(PEP.dir, "PEP725_data_clean.csv", sep="/")) %>% 
+  arrange(species, s_id, year) %>% 
+  group_by(species) %>% 
+  mutate(
+    # Calculate species-level mean leaf-put dates
+    leaf_out_species_mean = round(mean(leaf_out)), 
+    # Timeseries x year identifier
+    ts_year = paste0(timeseries, "_", year),
+    # Site x year identifier
+    site_year = paste0(s_id, "_", year)) %>% 
+  ungroup()
+
+
+#-------------------------------------------------
+## Import daily climatic datasets from GLDAS
+#-------------------------------------------------
+
+#define climate variables
+list.files(EOBS.dir)
+vn <- c("tg_ens_mean_0.1deg_reg_v30.0e.csv", # daily mean temperature 
+        "tn_ens_mean_0.1deg_reg_v30.0e.csv", # daily minimum temperature
+        "tx_ens_mean_0.1deg_reg_v30.0e.csv") # daily maximum temperature
+
+#create empty list
+DataList <- replicate(length(vn),data.frame())
+#loop through climate variables
+for(i in 1:length(vn)) {
+  #read data
+  data = fread(paste0(EOBS.dir, "/", vn[i]))
+  #add table to list
+  DataList[[i]] = data }
+#add names to list
+names(DataList)=vn
+
+
+#-------------------------------------------------
+# Merge data and add names to list
+#-------------------------------------------------
+
+# Add additional datasets
+DataList[[length(DataList) + 1]] <- PEP.df
+
+# Remove data
+rm(PEP.df)
+
+# Set all names
+names(DataList) = c(vn, "PEP725")
+names(DataList)
+
+```
+
+</details>
+
+<br>
+
+# 2. Parallel computing
+
+<details>
+
+<summary>Create loop</summary>
+
+```{r}
+##########################################################
+# Loop through each observation using parallel computing #
+##########################################################
+
+
+
+# Identifier for loop (all timeseries x year combinations)
+timeseries_year  = unique(DataList[["PEP725"]]$ts_year)
+
+# Parallel processing function
+parallelCalc <- function(timeseries_years, DataList) {
+ 
+  #-------------------------------------------------
+  # extract PEP data per site x year combination
+  #-------------------------------------------------
+  
+  pheno.sub <- DataList[["PEP725"]][DataList[["PEP725"]]$ts_year == timeseries_years, ]
+  # Skip if doesn't exist
+  if (nrow(pheno.sub) == 0) return(NULL)
+
+  
+  #--------------------------------------------------------------
+  # Define the length of the period of interest in calendar units
+  #--------------------------------------------------------------
+  
+  year1 <- as.character(pheno.sub$year - 1)
+  year2 <- as.character(pheno.sub$year)
+  start_doy <- paste0(year1, "-01-01")
+  end_doy <- paste0(year2, "-06-30")
+  days <- seq(as.Date(start_doy), as.Date(end_doy), by = "days")
+  
+  #get number of days in year 1 and year 2
+  days_year1 <- length(seq(as.Date(start_doy), as.Date(paste0(year1, "-12-31")), by = "days"))
+  days_year2 <- length(seq(as.Date(paste0(year2, "-01-01")), as.Date(end_doy), by = "days"))
+  
+  
+  #-------------------------------------------------
+  # Load and merge all climate variables
+  #-------------------------------------------------
+  
+  # Function to load climate data
+  get_subdata <- function(var_index) {
+    # Year 1
+    sub1 <- DataList[[var_index]][DataList[[var_index]]$s_id == pheno.sub$s_id &
+                                    DataList[[var_index]]$year == year1, as.character(1:days_year1), with = FALSE]
+    # Year 2
+    sub2 <- DataList[[var_index]][DataList[[var_index]]$site_year == pheno.sub$site_year, as.character(1:days_year2), with = FALSE]
+    if (nrow(sub1) == 0 || nrow(sub2) == 0) return(NULL)
+    cbind(sub1, sub2)
+    }
+    
+    # ------------------------------------------------------------------------
+    # Short Name        ; Long Name                               ; Unit [d-1]
+    # ------------------------------------------------------------------------
+    # TMIN              ; Minimum Air Temperature                 ; degC
+    # TMEAN             ; Mean Air Temperature                    ; degC
+    # TMAX              ; Maximum Air Temperature                 ; degC
+    # ------------------------------------------------------------------------
+    
+    Tmean <- get_subdata(1)
+    Tmin  <- get_subdata(2)
+    Tmax  <- get_subdata(3)
+    
+    if (any(sapply(list(Tmean, Tmin, Tmax), is.null))) {return(NULL)}
+    
+    
+    #-------------------------------------------------
+    # Table of climate variables
+    #-------------------------------------------------
+    
+    daily_vals <- data.frame(
+      Year  = lubridate::year(days),
+      Month = lubridate::month(days),
+      Day   = lubridate::day(days),
+      DOY   = 1:length(days),
+      Tmin  = as.numeric(Tmin),
+      Tmean = as.numeric(Tmean),
+      Tmax  = as.numeric(Tmax) )
+     
+    
+    #-------------------------------------------------
+    # Generate sub-dataframe to store results
+    #-------------------------------------------------
+    
+    factors.sub <- pheno.sub %>% 
+      dplyr::select(s_id, species, timeseries, year, lat, lon)
+
+    
+    #-------------------------------------------------
+    # Get key dates
+    #-------------------------------------------------
+    
+    #row of mean leaf-out date
+    DOY_out_mean = days_year1 + pheno.sub$leaf_out_species_mean
+
+    
+    #-------------------------------------------------
+    # Preseason means for each climate driver
+    #-------------------------------------------------
+    
+    #*********************************************************************************
+    # Calculates preseason temperature: 
+    # - averages
+    # - intra-annual variation 
+    # - slopes
+    #*********************************************************************************
+    
+    # get preseason length vector (10 to 120 days with 30-day steps)
+    preseason.lengths = seq(30, 120, 30)
+    
+    #loop through preseasons
+    for(len in preseason.lengths) {
+      # define preseason period
+      idx = (DOY_out_mean - len) : DOY_out_mean
+      # Means
+      factors.sub[[paste0("Tmean.spring", len)]] <- mean(daily_vals$Tmean[idx], na.rm = TRUE)
+      factors.sub[[paste0("Tmax.spring", len)]]  <- mean(daily_vals$Tmax[idx],  na.rm = TRUE)
+      factors.sub[[paste0("Tmin.spring", len)]]  <- mean(daily_vals$Tmin[idx],  na.rm = TRUE)
+      # SDs
+      factors.sub[[paste0("Tmean.IntraSD.spring", len)]] <- sd(daily_vals$Tmean[idx], na.rm = TRUE)
+      factors.sub[[paste0("Tmax.IntraSD.spring", len)]]  <- sd(daily_vals$Tmax[idx],  na.rm = TRUE)
+      factors.sub[[paste0("Tmin.IntraSD.spring", len)]]  <- sd(daily_vals$Tmin[idx],  na.rm = TRUE)
+      # Slopes
+      factors.sub[[paste0("Tmean.slope.spring", len)]] <- coef(lm(daily_vals$Tmean[idx] ~ daily_vals$DOY[idx]))[2]
+      factors.sub[[paste0("Tmax.slope.spring", len)]] <- coef(lm(daily_vals$Tmax[idx] ~ daily_vals$DOY[idx]))[2]
+      factors.sub[[paste0("Tmin.slope.spring", len)]] <- coef(lm(daily_vals$Tmin[idx] ~ daily_vals$DOY[idx]))[2]
+      }
+
+    
+    #-------------------------------------------------
+    # Safe the table  
+    #-------------------------------------------------
+    
+    return(factors.sub) 
+    
+ }
+```
+
+</details>
+
+<details>
+
+<summary>Run loop and safe data</summary>
+
+```{r}
+#-------------------------------------------------
+# Run in parallel
+#-------------------------------------------------
+
+outputlist <- pbmclapply(timeseries_year, function(y) parallelCalc(y, DataList), mc.cores = 12, mc.preschedule = T)
+climate.factors.df <- rbindlist(outputlist, fill = TRUE)
+
+
+#-------------------------------------------------
+# Save results
+#-------------------------------------------------
+
+write.csv(climate.factors.df, file.path(output.dir, "pep_drivers_spring_climate.csv"))
+```
+
+</details>
+
+<br>
+
+# 3. Reproducibility
+
+<details>
+
+<summary>Show</summary>
+
+```{r}
+# date time
+Sys.time()
+
+# Session info
+sessionInfo()
+```
+
+</details>

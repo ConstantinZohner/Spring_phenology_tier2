@@ -1,0 +1,300 @@
+---
+title: "Spring phenology tier2 project"
+subtitle: "Check MODIS sample sizes after driver extraction"
+author: "Constantin Zohner"
+date: "Last run: `r format(Sys.Date(), '%d %B %Y')`"
+
+format:
+  html:
+    toc: false
+    theme: default
+    highlight-style: haddock
+    df-print: paged
+    embed-resources: true
+
+execute:
+  #warning: false
+  message: false
+  echo: true
+  output: true
+
+always_allow_html: true
+editor: visual
+editor_options:
+  chunk_output_type: inline
+---
+
+# 1. Setup
+
+<details>
+
+<summary>Packages</summary>
+
+```{r, message=F}
+require(data.table)
+require(ggplot2)
+require(tidyverse)
+```
+
+</details>
+
+<details>
+
+<summary>Plot theme</summary>
+
+```{r, message=F}
+plotTheme1 = theme(legend.background = element_rect(fill=NA, linewidth=0.5, linetype="solid"),
+                   legend.text       = element_text(color="black"),
+                   panel.grid.major  = element_blank(),
+                   panel.grid.minor  = element_blank(),
+                   panel.background  = element_blank(),
+                   panel.border      = element_rect(colour = "black", fill=NA),
+                   axis.line         = element_line(color = "black"),
+                   axis.text         = element_text(colour = "black"),
+                   strip.background  = element_rect(fill=NA),
+                   strip.text        = element_text(colour = 'black', face="italic"),
+                   plot.title        = element_text(face="bold"))
+```
+
+</details>
+
+<details>
+
+<summary>Directories</summary>
+
+```{r}
+#-------------------------------------------------
+# Define the base directory
+#-------------------------------------------------
+
+base.dir = "/Users/goalie/Desktop/PhD/Publication_material/40_Spring_phenology_tier2/MODIS_Analysis"
+
+
+#-------------------------------------------------
+# Build specific directories from the base
+#-------------------------------------------------
+
+# Model results
+MODIS.dir = file.path(base.dir, "Analysis_input/MODIS_drivers")
+
+# Figure output
+figure.dir = file.path(base.dir, "Analysis_output/LocationMaps")
+```
+
+</details>
+
+<details>
+
+<summary>Data</summary>
+
+```{r}
+MODIS.df <- fread(paste(MODIS.dir, "MODIS_drivers_spring_data.csv", sep="/")) %>% 
+  
+  # delete boreal biomes and conifers
+  filter(! Biome %in% c(6,11),
+         LC == 4) %>% 
+  
+  # count the number of years (rows) per pixel
+  group_by(s_id) %>%
+  mutate(n.years = n()) %>% 
+  ungroup() %>% 
+  
+  # Add new biogeogrpahy column (Forest type x Continent combination)
+  mutate(ForestType_Continent = ifelse(lon < -30,  "North America", 
+                                       ifelse(lon >= -30 & lon <70, "Europe", "Asia")))
+```
+
+</details>
+
+<br>
+
+# 2. Check sample sizes
+
+<details>
+
+<summary>show</summary>
+
+```{r}
+# Total observations
+nrow(MODIS.df)
+
+# How many pixels in total?
+n_distinct(MODIS.df$s_id)
+
+# Time span 
+range(MODIS.df$year)
+paste0("Minimum timeseries length = ",   min(MODIS.df$n.years, na.rm = T),
+       "; Maximum timeseries length = ", max(MODIS.df$n.years, na.rm = T))
+
+# Histograms
+hist(MODIS.df$n.years, xlab="Number of years", main="Time series length", breaks = 30)
+hist(MODIS.df$year, xlab="Year", main="Temporal distribution of data", breaks = 30)
+
+# Latitudinal and longitudinal gradients
+range(MODIS.df$lon)
+range(MODIS.df$lat)
+hist(MODIS.df$lon, xlab="Longitude", main="Longitudinal gradient", breaks = 100)
+hist(MODIS.df$lat, xlab="Latitude",  main="Latitudinal gradient",  breaks = 100)
+
+
+# Distribution of phenology metrics
+###################################
+
+# Define all phenology metrics
+metrics <- c("Greenup", "MidGreenup", "MidGreendown_prev")
+
+for (metric in metrics) {
+  print(paste("Summary for", metric))
+  print(mean(MODIS.df[[metric]], na.rm = TRUE))
+  print(sd(MODIS.df[[metric]], na.rm = TRUE))
+  print(range(MODIS.df[[metric]], na.rm = TRUE))
+  
+  # Histogram for overall distribution
+  hist(MODIS.df[[metric]], 
+       xlab = paste(metric, "date"), 
+       main = paste(metric, "gradient"), 
+       breaks = 100)
+  
+  # Histogram by Forest Type using ggplot2
+  p = ggplot(MODIS.df, aes(x = .data[[metric]])) +
+  geom_histogram(bins = 100, fill = "steelblue", color = "black", alpha = 0.7) +
+  xlab(paste(metric, "Date")) +
+  ylab("Frequency") +
+  ggtitle(paste(metric, "Gradient by Forest Type")) +
+  facet_wrap(~ ForestType_Continent, scales = "free_y") +
+  theme_classic()
+  
+  print(p)
+}
+
+# Forest type-level statistics
+##############################
+
+# Create summary dataframe per Forest Type
+sample.size = MODIS.df %>%
+  group_by(ForestType_Continent) %>% # Group by Forest Type
+  summarize(n.time.series  = n_distinct(lat, lon), # Count unique spatial locations (pixels)
+            n.observations = n()) # Count total observations
+
+# Display sample size summary
+data.frame(sample.size)
+
+# Total time series count
+sum(sample.size$n.time.series)
+
+# Convert wide to long format for visualization
+sample.size <- sample.size %>%
+  pivot_longer(cols = c(n.time.series, n.observations), # Columns to pivot
+               names_to = "Metric",                     # New column for variable names
+               values_to = "Count")                     # New column for values
+
+# Bar Plot for Sample Size
+ggplot(sample.size, aes(x = factor(ForestType_Continent), y = Count, fill = Metric)) +  
+  geom_bar(stat = "identity", position = "dodge") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  facet_wrap(~Metric, nrow=2, scales="free_y") +
+  scale_fill_manual(values = c("#1f78b4", "#33a02c")) +
+  labs(x = "Forest Type", y = "Count", fill = "Metric") +
+  theme_classic()
+
+# Temporal coverage per Forest Type
+ggplot(MODIS.df, aes(x = year)) +
+  geom_histogram(position = 'identity', binwidth = 1, fill = "steelblue", color = "black") +
+  facet_wrap(~ForestType_Continent, ncol=3, scales = "free_y") +
+  theme_classic() +
+  labs(title = "Temporal Coverage per Forest Type", x = "Year", y = "Count")
+
+
+# Location maps
+###############
+
+# Create base map with world borders
+mapWorld <- borders("world", colour="gray90", fill="gray90") 
+
+# Initialize ggplot with map
+mp <- ggplot() + mapWorld
+
+# Filter unique stations (one per pixel)
+MODIS_unique <- MODIS.df[!duplicated(MODIS.df[, c("lat", "lon")]), ]
+
+
+# Add points for stations, with Biome-based coloring
+mp_all <- mp + 
+  geom_point(data = MODIS_unique, 
+             aes(x = lon, y = lat, color = factor(Biome)),  # Color mapped correctly
+             size = 0.3, shape = 15) +
+  coord_cartesian(ylim = range(MODIS.df$lat), 
+                  xlim = range(MODIS.df$lon)) +
+  xlab("Longitude") + 
+  ylab("Latitude") +
+  theme_classic() +
+  theme(legend.position = c(0.05, 0.25)) +
+  #scale_color_manual(values = c("#e41a1c","#377eb8","#4daf4a","#984ea3")) +  # Optional: Custom biome colors
+  labs(color = "Biome Type")  # Legend label
+
+# Save plot as PDF
+ggsave("AllLocations_biomes_final.pdf", plot = mp_all, path = figure.dir, width = 16, height = 4)
+
+# Display the map
+mp_all
+
+# Add points for stations, with PFT-based coloring
+mp_PFT <- mp + 
+  geom_point(data = MODIS_unique, 
+             aes(x = lon, y = lat, color = factor(LC)),  # Color mapped correctly
+             size = 0.3, shape = 15) +
+  coord_cartesian(ylim = range(MODIS.df$lat), 
+                  xlim = range(MODIS.df$lon)) +
+  xlab("Longitude") + 
+  ylab("Latitude") +
+  theme_classic() +
+  theme(legend.position = c(0.05, 0.25)) +
+  scale_color_manual(values = c("#4daf4a","#377eb8")) +  # Optional: Custom biome colors
+  labs(color = "PFT")  # Legend label
+
+# Save plot as PDF
+ggsave("AllLocations_PFT_final.pdf", plot = mp_PFT, path = figure.dir, width = 16, height = 4)
+
+# Display the map
+mp_PFT
+
+# Add points for stations, with forest type-based coloring
+mp_type <- mp + 
+  geom_point(data = MODIS_unique, 
+             aes(x = lon, y = lat, color = ForestType_Continent),  # Color mapped correctly
+             size = 0.5, shape = 15) +
+  coord_cartesian(ylim = range(MODIS.df$lat), 
+                  xlim = range(MODIS.df$lon)) +
+  xlab("Longitude") + 
+  ylab("Latitude") +
+  theme_classic() +
+  theme(legend.position = c(0.08, 0.29)) +
+  scale_color_manual(values = c("#1b9e77", "#d95f02", "#7570b3")) +  # Custom biome colors ["#e31a1c","#ff7f00","#1f78b4","#33a02c"]
+  labs(color = "Continent")  # Legend label
+
+# Save plot as PDF
+ggsave("AllLocations_forest_type_final.pdf", plot = mp_type, path = figure.dir, width = 16, height = 3)
+
+# Display the map
+mp_type
+```
+
+</details>
+
+<br>
+
+# 3. Reproducibility
+
+<details>
+
+<summary>show</summary>
+
+```{r}
+# Datetime
+Sys.time()
+
+# Session info
+sessionInfo()
+```
+
+</details>

@@ -1,0 +1,747 @@
+---
+title: "Spring phenology tier2 project"
+subtitle: "Find optimal preseason periods for MODIS data"
+author: "Constantin Zohner"
+date: "Last run: `r format(Sys.Date(), '%d %B %Y')`"
+
+format:
+  html:
+    toc: false
+    theme: default
+    highlight-style: haddock
+    df-print: paged
+    embed-resources: true
+
+execute:
+  #warning: false
+  message: false
+  echo: true
+  output: true
+
+always_allow_html: true
+editor: visual
+editor_options:
+  chunk_output_type: inline
+---
+
+# 1. Setup
+
+<details>
+
+<summary>Packages</summary>
+
+```{r, message=F}
+require(tidyverse)
+require(data.table)
+require(broom)
+require(patchwork)
+require(MASS)
+require(wesanderson)
+```
+
+</details>
+
+<details>
+
+<summary>Plot theme</summary>
+
+```{r, message=F}
+plotTheme1 = theme(legend.position   = "none",
+                   legend.background = element_rect(fill=NA, linewidth=0.5, linetype="solid"),
+                   legend.text       = element_text(color="black"),
+                   panel.grid.major  = element_blank(),
+                   panel.grid.minor  = element_blank(),
+                   panel.background  = element_blank(),
+                   panel.border      = element_rect(colour = "black", fill=NA),
+                   axis.line         = element_line(color = "black"),
+                   axis.text         = element_text(colour = "black"),
+                   strip.background  = element_rect(fill=NA),
+                   strip.text        = element_text(colour = 'black'),
+                   plot.title        = element_text(face="bold"))
+```
+
+</details>
+
+<details>
+
+<summary>Directories</summary>
+
+```{r}
+#-------------------------------------------------
+# Define the base directory
+#-------------------------------------------------
+
+base.dir = "/Users/goalie/Desktop/PhD/Publication_material/40_Spring_phenology_tier2/MODIS_Analysis"
+
+
+#-------------------------------------------------
+# Build specific directories from the base
+#-------------------------------------------------
+
+# Model results
+MODIS.dir = file.path(base.dir, "Analysis_input/MODIS_drivers")
+
+# Figure output
+output.dir = file.path(base.dir, "Analysis_output/Preseason_sensitivity")
+```
+
+</details>
+
+<details>
+
+<summary>Data</summary>
+
+```{r}
+MODIS.df <- fread(paste(MODIS.dir, "MODIS_drivers_spring_data.csv", sep="/")) %>% 
+  dplyr::select(-V1) %>% 
+  # delete boreal biomes and conifers
+  filter(! Biome %in% c(6,11),
+         LC == 4) %>% 
+  # Add new biogeogrpahy column (Forest type x Continent combination)
+  mutate(ForestType_Continent = ifelse(lon < -30,  "North America", 
+                                       ifelse(lon >= -30 & lon <70, "Europe", "Asia")))
+```
+
+</details>
+
+<br>
+
+# 2. Preseason analysis and figures
+
+<details>
+
+<summary>Greenup dates</summary>
+
+```{r, warning =F, message=F}
+########################
+## Get best preseason ##
+########################
+
+
+
+#-------------------------------------------------
+# Reshape table to long format
+#-------------------------------------------------
+
+preseason.df = MODIS.df %>%
+  #select columns
+  dplyr::select(s_id,year,ForestType_Continent,LC,Biome,Greenup,
+                starts_with(c("Tmean.PS.GU","Tmin.PS.GU","Tmax.PS.GU","SWrad.PS.GU","RH.PS.GU"))) %>%
+  #long format
+  pivot_longer(.,cols=starts_with(c("Tm","SWrad","RH")), names_to = "preseason", values_to = "value") %>%
+  #create preseason length and variable class columns
+  mutate(preseason_length = readr::parse_number(gsub("[.]", "", preseason)), #keep only numbers in string
+         var_class = gsub("\\..*",".GU", preseason)) %>%
+  dplyr::select(-preseason)
+
+
+#-------------------------------------------------
+# Correlation coefficients
+#-------------------------------------------------
+
+resultsLM = preseason.df %>%  
+  group_by(s_id, ForestType_Continent, var_class, preseason_length) %>% 
+  summarise(coeff = cor(Greenup, value)) %>% 
+  ungroup()
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+##########################################
+## Plot preseason-leaf-out correlations ##
+##########################################
+
+
+
+#-------------------------------------------------
+# Mean across all pixels and forest types
+#-------------------------------------------------
+
+ModelLabs <- c("RH","SWR",expression("T"["min"]), expression("T"["mean"]),expression("T"["max"]))
+plot.estimate.all = resultsLM %>%
+  mutate(var_class = factor(var_class, levels = c("RH.GU","SWrad.GU","Tmin.GU","Tmean.GU","Tmax.GU"))) %>% 
+  ggplot()+
+  aes(x=preseason_length, y=coeff, 
+      colour=var_class, group=var_class) +
+  geom_hline(yintercept = 0)+
+  stat_summary(fun = mean, geom="line", linewidth = .7) +
+  scale_color_manual(values = wes_palette("Zissou1", n = 5), labels=ModelLabs) +
+  stat_summary(fun.data = "mean_cl_normal", geom="errorbar", linewidth = 0.5, width=0) +
+  stat_summary(fun.data = "mean_cl_normal", geom="point", size = 1) +
+  xlab("Preseason length (days)") +
+  ylab("Correlation coefficient") +
+  coord_cartesian(ylim = c(-0.65, 0.65), xlim=c(14,116))+
+  plotTheme1+
+  theme(legend.position   = c(.84,.84),
+        legend.title = element_blank(),
+        legend.key = element_blank(),
+        legend.text.align = 0)
+
+
+#-------------------------------------------------
+# Forest type-specific
+#-------------------------------------------------
+
+plot.estimate = resultsLM %>%
+  mutate(var_class = factor(var_class, levels = c("RH.GU","SWrad.GU","Tmin.GU","Tmean.GU","Tmax.GU"))) %>% 
+  ggplot()+
+  aes(x=preseason_length, y=coeff, 
+      colour=var_class, group=var_class) +
+  geom_hline(yintercept = 0)+
+  stat_summary(fun = mean, geom="line", size = .7) +
+  scale_color_manual(values = (wes_palette("Zissou1", n = 5))) +
+  stat_summary(fun.data = "mean_cl_normal", geom="errorbar", linewidth = 0.5, width=0) +
+  stat_summary(fun.data = "mean_cl_normal", geom="point", size = 1) +
+  xlab("Preseason length (days)") +
+  ylab("Correlation coefficient") +
+  coord_cartesian(ylim = c(-0.7, 0.7),xlim=c(14,116))+
+  facet_wrap(~ForestType_Continent, ncol=1) +
+  plotTheme1 +
+  theme(strip.text.x = element_blank())
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+#####################################################
+## Plot best preseason length for each temperature ##
+#####################################################
+
+
+
+#keep only models with highest absolute correlation coefficients
+resultsLM2 = resultsLM %>%   
+  group_by(s_id,var_class) %>% 
+  top_n(1, abs(coeff)) %>%
+  ungroup()
+
+#Mean preseason length
+resultsLM2 %>% 
+  group_by(ForestType_Continent, var_class) %>% 
+  summarize(meanPre = mean(preseason_length)) %>% 
+  ungroup()
+
+
+#-------------------------------------------------
+# Mean across all pixels and forest type
+#-------------------------------------------------
+
+plot.length.all = resultsLM2 %>%
+  mutate(var_class = factor(var_class, levels = c("RH.GU","SWrad.GU","Tmin.GU","Tmean.GU","Tmax.GU"))) %>% 
+  dplyr::select(ForestType_Continent,var_class,preseason_length)%>%
+  ggplot()+
+  aes(x=var_class, y=preseason_length, colour=var_class, fill=var_class, alpha=0.5) +
+  geom_boxplot(outlier.colour = NA)+
+  scale_color_manual(values = wes_palette("Zissou1", n = 5)) +
+  scale_fill_manual(values = wes_palette("Zissou1", n = 5)) +
+  scale_x_discrete(labels= ModelLabs)+
+  coord_cartesian(ylim = c(10, 117))+
+  xlab("") +
+  ylab("Best preseason length (days)") +
+  plotTheme1+
+  theme(strip.text.x = element_blank(),
+        axis.text.x  = element_text(angle = 45, hjust=1))
+
+
+#-------------------------------------------------
+# Forest type-specific
+#-------------------------------------------------
+
+plot.length = resultsLM2 %>%
+  mutate(var_class = factor(var_class, levels = c("RH.GU","SWrad.GU","Tmin.GU","Tmean.GU","Tmax.GU"))) %>% 
+  dplyr::select(ForestType_Continent,var_class,preseason_length)%>%
+  ggplot()+
+  aes(x=var_class, y=preseason_length, colour=var_class, fill=var_class, alpha=0.5) +
+  scale_color_manual(values = (wes_palette("Zissou1", n = 5))) +
+  scale_fill_manual(values = wes_palette("Zissou1", n = 5)) +
+  scale_x_discrete(labels= ModelLabs)+
+  geom_boxplot(outlier.colour = NA)+
+  coord_cartesian(ylim = c(10, 117))+
+  xlab("") +
+  ylab("Best preseason length (days)") +
+  facet_wrap(~ForestType_Continent, ncol=1) +
+  plotTheme1+
+  theme(strip.text.x = element_blank(),
+        axis.text.x  = element_text(angle = 45, hjust=1))
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+#######################################
+#Add best preseason temps to MODIS data
+#######################################
+
+
+
+#add variables
+MODIS.df = MODIS.df %>%
+  inner_join(., preseason.df %>%
+               #filter by model data
+               semi_join(resultsLM2, by=c('s_id','var_class','preseason_length')) %>%
+               dplyr::select(c(s_id,year,var_class,value))%>%
+               pivot_wider(.,names_from = var_class, values_from = value),
+             by = c("year", "s_id"))
+
+#add preseason lengths
+MODIS.df = MODIS.df %>%
+  inner_join(., preseason.df %>%
+               #filter by model data
+               semi_join(resultsLM2, by=c('s_id','var_class','preseason_length')) %>%
+               dplyr::select(c(s_id,year,var_class,preseason_length))%>%
+               mutate(var_class = paste(var_class, "length", sep="_")) %>% 
+               pivot_wider(.,names_from = var_class, values_from = preseason_length),
+             by = c("year", "s_id"))
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+##################################
+#Run linear ridge regression model
+##################################
+
+
+
+resultsLM3 = MODIS.df %>% 
+  group_by(s_id,ForestType_Continent) %>% 
+  do({model = lm.ridge(scale(Greenup) ~ scale(Tmax.GU)+scale(SWrad.GU)+scale(RH.GU), data=.)  # linear model
+  data.frame(tidy(model),         # coefficient info
+             glance(model))}) %>% # model info
+  filter(!term %in% c("(Intercept)")) %>%
+  ungroup()%>%
+  #rename variable class
+  mutate(term=recode(term,
+                     `scale(Tmax.GU)`="Tmax",
+                     `scale(RH.GU)`="RH",
+                     `scale(SWrad.GU)`="SWrad"))
+
+
+# Plot preseason-leaf-out correlations
+######################################
+
+ModelLabs2 <- c("RH","SWR",expression("T"["max"]))
+
+
+#-------------------------------------------------
+# Mean across all pixels and forest type
+#-------------------------------------------------
+
+plot.ridge.all = resultsLM3 %>%
+  ggplot()+
+  aes(x=term, y=estimate, colour=term, fill=term, alpha=0.5) +
+  scale_color_manual(values = c("#3B9AB2","#78B7C5","#F21A00")) +
+  scale_fill_manual(values = c("#3B9AB2","#78B7C5","#F21A00")) +
+  scale_x_discrete(labels= ModelLabs2)+
+  geom_boxplot(outlier.shape = NA)+
+  geom_hline(yintercept = 0)+
+  xlab("") +
+  ylab("Standardized coefficient (ridge regression)") +
+  coord_cartesian(ylim = c(-0.9, 0.9))+
+  plotTheme1+
+  theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+
+#-------------------------------------------------
+# Forest type-specific
+#-------------------------------------------------
+
+plot.ridge = resultsLM3 %>%
+  ggplot()+
+  aes(x=term, y=estimate, colour=term, fill=term, alpha=0.5) +
+  scale_color_manual(values = c("#3B9AB2","#78B7C5","#F21A00")) +
+  scale_fill_manual(values = c("#3B9AB2","#78B7C5","#F21A00")) +
+  scale_x_discrete(labels= ModelLabs2)+
+  geom_boxplot(outlier.shape = NA)+
+  geom_hline(yintercept = 0)+
+  xlab("") +
+  ylab("Standardized coefficient (ridge regression)") +
+  coord_cartesian(ylim = c(-0.9, 0.9))+
+  facet_wrap(~ForestType_Continent, ncol=1,strip.position = "right") +
+  plotTheme1+
+  theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+##########################
+# Arrange and safe plots #
+##########################
+
+
+
+#define plot layout
+layout <- "BCD"
+
+#Merge plots
+PreseasonPlotAll = plot.estimate.all + plot.length.all + plot.ridge.all +
+  plot_layout(design = layout) + plot_annotation(tag_levels = 'a')&
+  theme(plot.tag = element_text(face = 'bold'))
+PreseasonPlotAll
+
+PreseasonPlot = plot.estimate + plot.length + plot.ridge +
+  plot_layout(design = layout) + plot_annotation(tag_levels = 'a')&
+  theme(plot.tag = element_text(face = 'bold'))
+PreseasonPlot
+
+#Safe plot
+pdf(paste(output.dir,"Preseason_sensitivity_all_Greenup_MODIS.pdf",sep="/"), width=10, height=4.2, useDingbats=FALSE)
+PreseasonPlotAll
+dev.off()
+
+pdf(paste(output.dir,"Preseason_sensitivity_ForestType_Greenup_MODIS.pdf",sep="/"), width=7.2, height=8, useDingbats=FALSE)
+PreseasonPlot
+dev.off()
+```
+
+</details>
+
+<details>
+
+<summary>Mid-Greenup dates</summary>
+
+```{r, warning =F, message=F}
+########################
+## Get best preseason ##
+########################
+
+
+
+#-------------------------------------------------
+# Reshape table to long format
+#-------------------------------------------------
+
+preseason.df = MODIS.df %>%
+  #select columns
+  dplyr::select(s_id,year,ForestType_Continent,LC,Biome,MidGreenup,
+                starts_with(c("Tmean.PS.MG","Tmin.PS.MG","Tmax.PS.MG","SWrad.PS.MG","RH.PS.MG"))) %>%
+  #long format
+  pivot_longer(.,cols=starts_with(c("Tm","SWrad","RH")), names_to = "preseason", values_to = "value") %>%
+  #create preseason length and variable class columns
+  mutate(preseason_length = readr::parse_number(gsub("[.]", "", preseason)), #keep only numbers in string
+         var_class = gsub("\\..*",".MG", preseason)) %>%
+  dplyr::select(-preseason)
+
+
+#-------------------------------------------------
+# Correlation coefficients
+#-------------------------------------------------
+
+resultsLM = preseason.df %>%  
+  group_by(s_id, ForestType_Continent, var_class, preseason_length) %>% 
+  summarise(coeff = cor(MidGreenup, value)) %>% 
+  ungroup()
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+##########################################
+## Plot preseason-leaf-out correlations ##
+##########################################
+
+
+
+#-------------------------------------------------
+# Mean across all pixels and forest types
+#-------------------------------------------------
+
+ModelLabs <- c("RH","SWR",expression("T"["min"]), expression("T"["mean"]),expression("T"["max"]))
+plot.estimate.all = resultsLM %>%
+  mutate(var_class = factor(var_class, levels = c("RH.MG","SWrad.MG","Tmin.MG","Tmean.MG","Tmax.MG"))) %>% 
+  ggplot()+
+  aes(x=preseason_length, y=coeff, 
+      colour=var_class, group=var_class) +
+  geom_hline(yintercept = 0)+
+  stat_summary(fun = mean, geom="line", linewidth = .7) +
+  scale_color_manual(values = wes_palette("Zissou1", n = 5), labels=ModelLabs) +
+  stat_summary(fun.data = "mean_cl_normal", geom="errorbar", linewidth = 0.5, width=0) +
+  stat_summary(fun.data = "mean_cl_normal", geom="point", size = 1) +
+  xlab("Preseason length (days)") +
+  ylab("Correlation coefficient") +
+  coord_cartesian(ylim = c(-0.65, 0.65), xlim=c(14,116))+
+  plotTheme1+
+  theme(legend.position   = c(.84,.84),
+        legend.title = element_blank(),
+        legend.key = element_blank(),
+        legend.text.align = 0)
+
+
+#-------------------------------------------------
+# Forest type-specific
+#-------------------------------------------------
+
+plot.estimate = resultsLM %>%
+  mutate(var_class = factor(var_class, levels = c("RH.MG","SWrad.MG","Tmin.MG","Tmean.MG","Tmax.MG"))) %>% 
+  ggplot()+
+  aes(x=preseason_length, y=coeff, 
+      colour=var_class, group=var_class) +
+  geom_hline(yintercept = 0)+
+  stat_summary(fun = mean, geom="line", size = .7) +
+  scale_color_manual(values = (wes_palette("Zissou1", n = 5))) +
+  stat_summary(fun.data = "mean_cl_normal", geom="errorbar", linewidth = 0.5, width=0) +
+  stat_summary(fun.data = "mean_cl_normal", geom="point", size = 1) +
+  xlab("Preseason length (days)") +
+  ylab("Correlation coefficient") +
+  coord_cartesian(ylim = c(-0.7, 0.7),xlim=c(14,116))+
+  facet_wrap(~ForestType_Continent, ncol=1) +
+  plotTheme1 +
+  theme(strip.text.x = element_blank())
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+#####################################################
+## Plot best preseason length for each temperature ##
+#####################################################
+
+
+
+#keep only models with highest absolute correlation coefficients
+resultsLM2 = resultsLM %>%   
+  group_by(s_id,var_class) %>% 
+  top_n(1, abs(coeff)) %>%
+  ungroup()
+
+#Mean preseason length
+resultsLM2 %>% 
+  group_by(ForestType_Continent, var_class) %>% 
+  summarize(meanPre = mean(preseason_length)) %>% 
+  ungroup()
+
+
+#-------------------------------------------------
+# Mean across all pixels and forest type
+#-------------------------------------------------
+
+plot.length.all = resultsLM2 %>%
+  mutate(var_class = factor(var_class, levels = c("RH.MG","SWrad.MG","Tmin.MG","Tmean.MG","Tmax.MG"))) %>% 
+  dplyr::select(ForestType_Continent,var_class,preseason_length)%>%
+  ggplot()+
+  aes(x=var_class, y=preseason_length, colour=var_class, fill=var_class, alpha=0.5) +
+  geom_boxplot(outlier.colour = NA)+
+  scale_color_manual(values = wes_palette("Zissou1", n = 5)) +
+  scale_fill_manual(values = wes_palette("Zissou1", n = 5)) +
+  scale_x_discrete(labels= ModelLabs)+
+  coord_cartesian(ylim = c(10, 117))+
+  xlab("") +
+  ylab("Best preseason length (days)") +
+  plotTheme1+
+  theme(strip.text.x = element_blank(),
+        axis.text.x  = element_text(angle = 45, hjust=1))
+
+
+#-------------------------------------------------
+# Forest type-specific
+#-------------------------------------------------
+
+plot.length = resultsLM2 %>%
+  mutate(var_class = factor(var_class, levels = c("RH.MG","SWrad.MG","Tmin.MG","Tmean.MG","Tmax.MG"))) %>% 
+  dplyr::select(ForestType_Continent,var_class,preseason_length)%>%
+  ggplot()+
+  aes(x=var_class, y=preseason_length, colour=var_class, fill=var_class, alpha=0.5) +
+  scale_color_manual(values = (wes_palette("Zissou1", n = 5))) +
+  scale_fill_manual(values = wes_palette("Zissou1", n = 5)) +
+  scale_x_discrete(labels= ModelLabs)+
+  geom_boxplot(outlier.colour = NA)+
+  coord_cartesian(ylim = c(10, 117))+
+  xlab("") +
+  ylab("Best preseason length (days)") +
+  facet_wrap(~ForestType_Continent, ncol=1) +
+  plotTheme1+
+  theme(strip.text.x = element_blank(),
+        axis.text.x  = element_text(angle = 45, hjust=1))
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+#######################################
+#Add best preseason temps to MODIS data
+#######################################
+
+
+
+#add variables
+MODIS.df = MODIS.df %>%
+  inner_join(., preseason.df %>%
+               #filter by model data
+               semi_join(resultsLM2, by=c('s_id','var_class','preseason_length')) %>%
+               dplyr::select(c(s_id,year,var_class,value))%>%
+               pivot_wider(.,names_from = var_class, values_from = value),
+             by = c("year", "s_id"))
+
+#add preseason lengths
+MODIS.df = MODIS.df %>%
+  inner_join(., preseason.df %>%
+               #filter by model data
+               semi_join(resultsLM2, by=c('s_id','var_class','preseason_length')) %>%
+               dplyr::select(c(s_id,year,var_class, preseason_length))%>%
+               mutate(var_class = paste(var_class, "length", sep="_")) %>% 
+               pivot_wider(.,names_from = var_class, values_from = preseason_length),
+             by = c("year", "s_id"))
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+###################################
+# Run linear ridge regression model
+###################################
+
+
+
+resultsLM3 = MODIS.df %>% 
+  group_by(s_id,ForestType_Continent) %>% 
+  do({model = lm.ridge(scale(MidGreenup) ~ scale(Tmax.MG)+scale(SWrad.MG)+scale(RH.MG), data=.)  # linear model
+  data.frame(tidy(model),         # coefficient info
+             glance(model))}) %>% # model info
+  filter(!term %in% c("(Intercept)")) %>%
+  ungroup()%>%
+  #rename variable class
+  mutate(term=recode(term,
+                     `scale(Tmax.MG)`="Tmax",
+                     `scale(RH.MG)`="RH",
+                     `scale(SWrad.MG)`="SWrad"))
+
+
+# Plot preseason-leaf-out correlations
+######################################
+
+ModelLabs2 <- c("RH","SWR",expression("T"["max"]))
+
+
+#-------------------------------------------------
+# Mean across all pixels and forest type
+#-------------------------------------------------
+
+plot.ridge.all = resultsLM3 %>%
+  ggplot()+
+  aes(x=term, y=estimate, colour=term, fill=term, alpha=0.5) +
+  scale_color_manual(values = c("#3B9AB2","#78B7C5","#F21A00")) +
+  scale_fill_manual(values = c("#3B9AB2","#78B7C5","#F21A00")) +
+  scale_x_discrete(labels= ModelLabs2)+
+  geom_boxplot(outlier.shape = NA)+
+  geom_hline(yintercept = 0)+
+  xlab("") +
+  ylab("Standardized coefficient (ridge regression)") +
+  coord_cartesian(ylim = c(-0.9, 0.9))+
+  plotTheme1+
+  theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+
+#-------------------------------------------------
+# Forest type-specific
+#-------------------------------------------------
+
+plot.ridge = resultsLM3 %>%
+  ggplot()+
+  aes(x=term, y=estimate, colour=term, fill=term, alpha=0.5) +
+  scale_color_manual(values = c("#3B9AB2","#78B7C5","#F21A00")) +
+  scale_fill_manual(values = c("#3B9AB2","#78B7C5","#F21A00")) +
+  scale_x_discrete(labels= ModelLabs2)+
+  geom_boxplot(outlier.shape = NA)+
+  geom_hline(yintercept = 0)+
+  xlab("") +
+  ylab("Standardized coefficient (ridge regression)") +
+  coord_cartesian(ylim = c(-0.9, 0.9))+
+  facet_wrap(~ForestType_Continent, ncol=1,strip.position = "right") +
+  plotTheme1+
+  theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+
+
+##############################################################################################################################################
+##############################################################################################################################################
+
+
+
+##########################
+# Arrange and safe plots #
+##########################
+
+
+
+#define plot layout
+layout <- "BCD"
+
+#Merge plots
+PreseasonPlotAll = plot.estimate.all + plot.length.all + plot.ridge.all +
+  plot_layout(design = layout) + plot_annotation(tag_levels = 'a')&
+  theme(plot.tag = element_text(face = 'bold'))
+PreseasonPlotAll
+
+PreseasonPlot = plot.estimate + plot.length + plot.ridge +
+  plot_layout(design = layout) + plot_annotation(tag_levels = 'a')&
+  theme(plot.tag = element_text(face = 'bold'))
+PreseasonPlot
+
+#Safe plot
+pdf(paste(output.dir,"Preseason_sensitivity_all_MidGreenup_MODIS.pdf",sep="/"), width=10, height=4.2, useDingbats=FALSE)
+PreseasonPlotAll
+dev.off()
+
+pdf(paste(output.dir,"Preseason_sensitivity_ForestType_MidGreenup_MODIS.pdf",sep="/"), width=7.2, height=8, useDingbats=FALSE)
+PreseasonPlot
+dev.off()
+```
+
+</details>
+
+<details>
+
+<summary>Safe data</summary>
+
+```{r}
+write.csv(MODIS.df, paste(MODIS.dir, "MODIS_drivers_spring_data_preseason.csv", sep="/"))
+```
+
+</details>
+
+<br>
+
+# 3. Reproducibility
+
+<details>
+
+<summary>show</summary>
+
+```{r}
+# Datetime
+Sys.time()
+
+# Session info
+sessionInfo()
+```
+
+</details>
