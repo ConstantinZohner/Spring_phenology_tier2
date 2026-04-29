@@ -67,7 +67,7 @@ Scripts should be run in numerical order within each branch (1 → 2 → 3 → 4
 
 If you use this code, please cite:
 
-> Zohner, C.M., Wu, Z., Mo, L., Crowther, T.W., Fu, Y.H., Renner, S.S., Vitasse, Y. & Rebindaine, D. (2025). Spring temperature remains the dominant driver of leaf-out in a warming world. *Science* (in review). DOI: [to be added upon publication]
+> Zohner, C.M., Wu, Z., Mo, L., Crowther, T.W., Fu, Y.H., Renner, S.S., Vitasse, Y. & Rebindaine, D. (2025). Spring leaf-out keeps pace with warming across the Northern Hemisphere. *Nature* (in review). DOI: [to be added upon publication]
 
 ---
 
