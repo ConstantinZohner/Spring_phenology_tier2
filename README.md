@@ -1,14 +1,20 @@
-# Spring temperature remains the dominant driver of leaf-out in a warming world
+# Spring leaf-out keeps pace with warming across the Northern Hemisphere
 
 **Zohner, C.M., Wu, Z., Mo, L., Crowther, T.W., Fu, Y.H., Renner, S.S., Vitasse, Y. & Rebindaine, D.**
 
-*Science* (submitted)
+*Nature* (submitted)
 
 ---
 
 ## Overview
 
 This repository contains all code used to analyse spring leaf-out phenology across Northern Hemisphere deciduous broadleaf forests. The study integrates ground-based observations from the PEP725 network with satellite-derived phenology from MODIS, and uses Bayesian hierarchical models and growing-degree day simulations to quantify the drivers of spring leaf-out and the mechanisms behind apparent declines in temperature sensitivity.
+
+---
+
+## License
+
+This code is released under the [MIT License](LICENSE). You are free to use, modify, and distribute it with attribution.
 
 ---
 
@@ -41,9 +47,11 @@ All input data are publicly available and are **not** included in this repositor
 
 ---
 
-## Software requirements
+## System requirements
 
-All R code was developed and tested with **R 4.4**. Key packages:
+All R code was developed and tested with **R 4.4** on macOS and Linux. The HPC scripts additionally require a SLURM-based computing cluster. No non-standard hardware is required for local scripts.
+
+Key packages:
 
 | Package | Purpose |
 |---------|---------|
@@ -54,12 +62,58 @@ All R code was developed and tested with **R 4.4**. Key packages:
 | `terra`, `raster`, `sf` | Spatial data handling |
 | `geosphere` | Photoperiod calculation |
 | `ggplot2`, `patchwork` | Figures |
+| `parallel`, `pbmcapply` | Parallel processing (HPC scripts only) |
 
 ---
 
-## Running the code
+## Installation
 
-Scripts should be run in numerical order within each branch (1 → 2 → 3 → 4). Set your local data paths in the `set directories` chunk at the top of each script. HPC scripts assume a SLURM environment and use parallel processing via the `parallel` and `pbmcapply` packages.
+**1. Install R packages**
+
+```r
+install.packages(c(
+  "brms", "lme4", "chillR",
+  "data.table", "tidyverse",
+  "terra", "raster", "sf", "geosphere",
+  "ggplot2", "patchwork",
+  "parallel", "pbmcapply"
+))
+```
+
+**2. Install cmdstanr and CmdStan**
+
+`brms` requires CmdStan as a backend. Install `cmdstanr` from the Stan r-universe, then install CmdStan itself:
+
+```r
+install.packages("cmdstanr", repos = c("https://stan-dev.r-universe.dev", getOption("repos")))
+cmdstanr::install_cmdstan()  # downloads and compiles CmdStan (~5–10 min)
+```
+
+**Typical install time:** approximately 15–20 minutes on a standard desktop, dominated by CmdStan compilation.
+
+---
+
+## Demo
+
+To verify the installation, run the local (non-HPC) scripts on the provided example data subset:
+
+```r
+# From the PEP725/ directory, run scripts in order:
+# 1_data_prep.Rmd  →  2_driver_assembly.Rmd  →  3_models.Rmd  →  4_figures.Rmd
+```
+
+**Expected output:** Fitted model objects (`.rds`), coefficient summary tables (`.csv`), and figure files (`.pdf`/`.png`) written to the `output/` subdirectory within each branch.
+
+**Expected run time:** Local scripts (data preparation, driver assembly, figures) run in minutes to a few hours on a standard desktop. The Bayesian model fitting scripts and GDD simulations are designed for HPC and require days to weeks of compute time depending on cluster configuration and available cores. Full reproduction of all results therefore requires access to a computing cluster.
+
+---
+
+## Instructions for use
+
+1. Download the required input datasets from the sources listed above and place them in a local data directory.
+2. Open each script and set your local paths in the `set directories` chunk at the top of the file.
+3. Run scripts in numerical order within each branch (`1_` → `2_` → `3_` → `4_`).
+4. HPC scripts (`.r`) should be submitted via SLURM. Local scripts (`.Rmd`, `.qmd`) can be run interactively in RStudio or rendered via `rmarkdown::render()` / `quarto::quarto_render()`.
 
 ---
 
